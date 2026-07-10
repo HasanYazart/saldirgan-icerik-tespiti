@@ -1,5 +1,6 @@
 import os
 import torch
+from .nlp_service import preprocess_text, dictionary_check
 
 try:
     from transformers import BertTokenizer, BertForSequenceClassification
@@ -7,7 +8,6 @@ try:
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
 
-# Eğitilmiş modelin yolu (Şu an sahte, Colab'dan gelince buraya koyulacak)
 MODEL_PATH = "bert_best.pt"
 MODEL_NAME = "dbmdz/bert-base-turkish-cased"
 
@@ -33,28 +33,30 @@ class MLService:
                 print("✅ Model başarıyla yüklendi!")
             except Exception as e:
                 print(f"Model yüklenirken hata oluştu: {e}")
-                print("Mock (Sahte) model moduna geçiliyor.")
                 self.is_mock = True
         else:
-            print("Model dosyası (bert_best.pt) bulunamadı veya transformers yüklü değil.")
-            print("Mock (Sahte) model modunda çalışılıyor...")
             self.is_mock = True
 
     def analyze_text(self, text: str) -> dict:
         \"\"\"
         Metni analiz eder ve ne kadar saldırgan olduğunu döndürür.
         \"\"\"
+        # 1. NLP ÖN İŞLEME (Stemming, Typo Correction, Emoji Translation)
+        clean_text = preprocess_text(text)
+        
+        # 2. SÖZLÜK (KURAL BAZLI) KONTROL (Evasion/Boşluk Hilelerini Engeller)
+        if dictionary_check(clean_text):
+            return {"is_toxic": True, "toxicity_score": 0.99}
+
+        # 3. YAPAY ZEKA (BERT) ANALİZİ
         if self.is_mock:
-            # Sahte model mantığı: İçinde argo bir kelime geçiyorsa direkt %95 saldırgan say.
-            bad_words = ['s***', 'aptal', 'salak', 'gerizekalı', 'lan']
-            is_toxic = any(bw in text.lower() for bw in bad_words)
-            score = 0.95 if is_toxic else 0.05
-            return {"is_toxic": is_toxic, "toxicity_score": score}
+            # Mock mod: Zaten sözlük yakalamadıysa %95 güvenle temiz sayılır
+            return {"is_toxic": False, "toxicity_score": 0.05}
 
         # GERÇEK MODEL ÇALIŞMASI
         with torch.no_grad():
             encoding = self.tokenizer(
-                text, add_special_tokens=True, max_length=128,
+                clean_text, add_special_tokens=True, max_length=128,
                 padding='max_length', truncation=True,
                 return_attention_mask=True, return_tensors='pt'
             )
@@ -64,11 +66,9 @@ class MLService:
             outputs = self.model(input_ids, attention_mask=attention_mask)
             probs = torch.softmax(outputs.logits.float(), dim=1)
             
-            # Label 1 = Saldırgan, Label 0 = Normal
             toxic_prob = probs[0][1].item()
             is_toxic = toxic_prob > 0.5
             
             return {"is_toxic": is_toxic, "toxicity_score": round(toxic_prob, 4)}
 
-# Singleton instance
 ml_service = MLService()
