@@ -64,7 +64,7 @@ Bu projede Türkçe sosyal medya paylaşımlarının **saldırgan** veya **norma
 
 ### Adım 3: Repo'yu Klonlayın
 ```python
-!git clone https://github.com/KULLANICI_ADINIZ/saldirgan-icerik-tespiti.git
+!git clone https://github.com/HasanYazart/saldirgan-icerik-tespiti.git
 ```
 
 ### Adım 4: Eğitim Scriptini Çalıştırın

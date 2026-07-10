@@ -32,7 +32,7 @@ import subprocess
 
 # ============================
 # ⚠️ BURAYI KENDİ REPO URL'NİZLE DEĞİŞTİRİN ⚠️
-GITHUB_REPO_URL = "https://github.com/KULLANICI_ADINIZ/saldirgan-icerik-tespiti.git"
+GITHUB_REPO_URL = "https://github.com/HasanYazart/saldirgan-icerik-tespiti.git"
 # ============================
 
 # Colab'da çalışıp çalışmadığını kontrol et
