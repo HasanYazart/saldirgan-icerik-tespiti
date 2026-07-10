@@ -930,10 +930,41 @@ for metin in ornek_metinler:
 # ============================================================================
 
 if IN_COLAB:
-    print("\n💾 Sonuçları Google Drive'a kaydetmek için:")
-    print("   from google.colab import drive")
-    print("   drive.mount('/content/drive')")
-    print("   !cp -r sonuclar/ /content/drive/MyDrive/")
+    print("\n" + "=" * 60)
+    print("   💾 OTOMATİK GOOGLE DRIVE YEDEKLEMESİ")
+    print("=" * 60)
+    try:
+        from google.colab import drive
+        import shutil
+        
+        print("Google Drive'a bağlanılıyor. (Ekrana çıkan pencereden izin verin)")
+        drive.mount('/content/drive')
+        
+        hedef_klasor = '/content/drive/MyDrive/saldirgan_icerik_projesi'
+        hedef_sonuc = os.path.join(hedef_klasor, 'sonuclar')
+        hedef_model = os.path.join(hedef_klasor, 'modeller')
+        hedef_veri = os.path.join(hedef_klasor, 'veri_setleri')
+        
+        os.makedirs(hedef_sonuc, exist_ok=True)
+        os.makedirs(hedef_model, exist_ok=True)
+        os.makedirs(hedef_veri, exist_ok=True)
+        
+        print("Grafikler ve sonuçlar kopyalanıyor...")
+        for dosya in os.listdir(SONUC_KLASORU):
+            shutil.copy(os.path.join(SONUC_KLASORU, dosya), os.path.join(hedef_sonuc, dosya))
+            
+        print("Eğitilmiş modeller kopyalanıyor...")
+        for dosya in os.listdir(MODEL_KLASORU):
+            shutil.copy(os.path.join(MODEL_KLASORU, dosya), os.path.join(hedef_model, dosya))
+            
+        print("Temizlenmiş eğitim veri seti kopyalanıyor...")
+        if os.path.exists(DATASET_PATH):
+            shutil.copy(DATASET_PATH, os.path.join(hedef_veri, 'turkish_toxic_language_temiz.csv'))
+            
+        print(f"\n✅ BAŞARILI! Tüm dosyalar Google Drive hesabında '{hedef_klasor}' klasörüne güvenle kaydedildi.")
+    except Exception as e:
+        print("\n❌ Drive yedeklemesi sırasında bir hata oluştu:")
+        print(e)
 
 print("\n" + "=" * 60)
 print("   ✅ TÜM İŞLEMLER TAMAMLANDI!")
