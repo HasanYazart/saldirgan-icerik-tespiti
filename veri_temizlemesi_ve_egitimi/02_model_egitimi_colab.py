@@ -600,7 +600,7 @@ class ToxicDataset(Dataset):
     def __len__(self): return len(self.texts)
 
     def __getitem__(self, idx):
-        encoding = self.tokenizer.encode_plus(
+        encoding = self.tokenizer(
             str(self.texts[idx]), add_special_tokens=True,
             max_length=self.max_len, padding='max_length',
             truncation=True, return_attention_mask=True, return_tensors='pt'
@@ -906,7 +906,7 @@ ornek_metinler = [
 bert_model.eval()
 print()
 for metin in ornek_metinler:
-    encoding = bert_tokenizer.encode_plus(
+    encoding = bert_tokenizer(
         metin, add_special_tokens=True, max_length=BERT_MAX_LEN,
         padding='max_length', truncation=True,
         return_attention_mask=True, return_tensors='pt'
