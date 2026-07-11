@@ -36,6 +36,9 @@ Kullanım (Google Colab):
 # ============================================================================
 
 import os
+import json
+import hashlib
+import shutil
 import subprocess
 
 # GitHub repo URL
@@ -57,7 +60,12 @@ if IN_COLAB:
     print("✅ Kütüphaneler yüklendi!")
 
 # GitHub'dan repo klonla
-PROJE_KLASORU = "/content/saldirgan-icerik-tespiti" if IN_COLAB else os.path.dirname(os.path.abspath(__file__))
+SCRIPT_KLASORU = os.path.dirname(os.path.abspath(__file__))
+PROJE_KLASORU = (
+    "/content/saldirgan-icerik-tespiti"
+    if IN_COLAB
+    else os.path.abspath(os.path.join(SCRIPT_KLASORU, ".."))
+)
 
 if IN_COLAB:
     if os.path.exists(PROJE_KLASORU):
@@ -93,6 +101,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
 from collections import Counter
+
+if PROJE_KLASORU not in sys.path:
+    sys.path.insert(0, PROJE_KLASORU)
+from backend_api.text_processing import PREPROCESSING_VERSION, normalize_for_model
 
 warnings.filterwarnings('ignore')
 plt.rcParams['font.family'] = 'DejaVu Sans'
@@ -145,6 +157,7 @@ BERT_MAX_LEN    = 128
 BERT_BATCH_SIZE = 32
 BERT_EPOCHS     = 4
 BERT_LR         = 2e-5
+TARGET_FPR      = 0.01
 BERT_WARMUP     = 0.1        # Warmup oranı
 
 # Seed
@@ -153,6 +166,10 @@ np.random.seed(RANDOM_SEED)
 tf.random.set_seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(RANDOM_SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 print("✅ Hiperparametreler ayarlandı!")
 print(f"   Dropout: {DROPOUT_RATE} | L2: {L2_REG} | Label Smoothing: {LABEL_SMOOTH}")
@@ -173,10 +190,41 @@ df_test  = pd.read_csv(os.path.join(VERI_KLASORU, "test.csv"), encoding='utf-8')
 
 for df in [df_train, df_valid, df_test]:
     df.dropna(subset=['text', 'label'], inplace=True)
-    df['text'] = df['text'].astype(str)
+    df['text'] = df['text'].astype(str).map(normalize_for_model)
     df['label'] = df['label'].astype(int)
 
-print(f"   Train:      {len(df_train):,}")
+# ============================================================================
+# KÖKTEN ÇÖZÜM: HARD NEGATIVE INJECTION (FALSE POSITIVE ENGELLEYİCİ)
+# ============================================================================
+# Modelin 'git', 'mide', 'mal', 'meme' gibi kelimeleri doğrudan küfür
+# sanmasını (False Positive) engellemek için eğitim verisine 'Normal (0)'
+# etiketli zorlayıcı cümleler (Hard Negatives) enjekte ediyoruz.
+print("\n🛡️ Hard Negatives (Zorlayıcı Negatifler) eğitim setine ekleniyor...")
+hard_negatives = [
+    # Git / Mide türevleri
+    "mide git artık", "midem bulandı git", "git midem bulanıyor", "mide ağrım gitmedi",
+    "git işine", "hadi git buradan", "git artık lütfen", "eve git", "okula git",
+    "neden gitmiyorsun", "git de dinlen", "hastaneye git", "sinemaya git",
+
+    # Mal / Adi / Meme vb. türevleri
+    "mal varlığını sorguladılar", "mali durumumuz kötü", "bu mallar çok kaliteli",
+    "bu adil bir karar değil", "adi suçlar mahkemesi", "adi ortaklık",
+    "bu meme çok komik", "internet memesi paylaştı", "memeli hayvanlar",
+
+    # Sokak / Lanet / Ölüm vb.
+    "sokakta yürüyorduk", "sokak lambası", "sokak hayvanlarına yardım et",
+    "lanet olsun çok şanssızım", "gülmekten öldüm", "yorgunluktan bittim",
+    "öldüm bittim", "seni öldüresim var gülmekten",
+
+    # Diğer belirsiz olabilecek normal kullanımlar
+    "bana bak", "ne diyorsun", "saçmalama", "sus artık", "yeter", "aptalca bir hata yaptım"
+]
+
+# Hard negative'leri güçlendirmek için her cümleyi birkaç kez kopyalıyoruz
+df_hn = pd.DataFrame({'text': hard_negatives * 3, 'label': 0})
+df_train = pd.concat([df_train, df_hn], ignore_index=True)
+
+print(f"   Train:      {len(df_train):,} (+{len(df_hn)} Hard Negative)")
 print(f"   Validation: {len(df_valid):,}")
 print(f"   Test:       {len(df_test):,}")
 
@@ -747,6 +795,11 @@ for epoch in range(BERT_EPOCHS):
     if val_f1 > best_val_f1:
         best_val_f1 = val_f1
         torch.save(bert_model.state_dict(), os.path.join(MODEL_KLASORU, 'bert_best.pt'))
+
+        # Ek olarak modeli tam HuggingFace formatında kaydet
+        bert_model.save_pretrained(os.path.join(MODEL_KLASORU, 'bert_best_model'))
+        bert_tokenizer.save_pretrained(os.path.join(MODEL_KLASORU, 'bert_best_model'))
+
         print(f"   ✅ En iyi model kaydedildi! (val_f1: {val_f1:.4f})")
 
 bert_sure = datetime.now() - basla
@@ -785,6 +838,115 @@ print("\n🧪 BERT test değerlendirmesi...")
 bert_model.load_state_dict(torch.load(os.path.join(MODEL_KLASORU, 'bert_best.pt')))
 bert_model.eval()
 
+
+def collect_toxicity_probabilities(loader):
+    """Return label-1 probabilities and labels without changing model state."""
+    probabilities, labels_all = [], []
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
+            with autocast():
+                outputs = bert_model(input_ids, attention_mask=attention_mask)
+            probs = torch.softmax(outputs.logits.float(), dim=1)[:, 1]
+            probabilities.extend(probs.cpu().numpy())
+            labels_all.extend(labels.cpu().numpy())
+    return np.asarray(probabilities), np.asarray(labels_all)
+
+
+def select_threshold_for_low_fpr(probabilities, labels, target_fpr):
+    """Pick the lowest threshold that satisfies the validation FPR budget."""
+    candidates = []
+    negative_count = max(int((labels == 0).sum()), 1)
+
+    for threshold in np.arange(0.50, 1.0001, 0.005):
+        predictions = probabilities >= threshold
+        false_positives = int(((predictions == 1) & (labels == 0)).sum())
+        false_negatives = int(((predictions == 0) & (labels == 1)).sum())
+        false_positive_rate = false_positives / negative_count
+        if false_positive_rate <= target_fpr:
+            candidates.append((float(threshold), false_positives, false_negatives, false_positive_rate))
+
+    # Never silently lower the threshold when the validation target cannot be
+    # met. A conservative fallback protects normal users until labels/model
+    # quality can be improved.
+    return min(candidates, key=lambda candidate: candidate[0]) if candidates else (0.999, 0, 0, 1.0)
+
+
+validation_probs, validation_labels = collect_toxicity_probabilities(valid_loader)
+toxicity_threshold, val_fp, val_fn, val_fpr = select_threshold_for_low_fpr(
+    validation_probs, validation_labels, TARGET_FPR
+)
+threshold_config = {
+    "threshold": round(toxicity_threshold, 4),
+    "target_false_positive_rate": TARGET_FPR,
+    "validation_false_positive_rate": round(val_fpr, 6),
+    "validation_false_positives": val_fp,
+    "validation_false_negatives": val_fn,
+    "selection": "lowest_threshold_meeting_validation_fpr",
+}
+threshold_path = os.path.join(MODEL_KLASORU, "toxicity_threshold.json")
+with open(threshold_path, "w", encoding="utf-8") as threshold_file:
+    json.dump(threshold_config, threshold_file, ensure_ascii=False, indent=2)
+
+print(f"   Calibrated threshold: {toxicity_threshold:.3f} | validation FPR: {val_fpr:.2%}")
+print(f"   Threshold config saved: {threshold_path}")
+
+model_path = os.path.join(MODEL_KLASORU, "bert_best.pt")
+sha256 = hashlib.sha256()
+with open(model_path, "rb") as model_file:
+    for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
+        sha256.update(chunk)
+
+hf_directory_hash = hashlib.sha256()
+hf_directory = os.path.join(MODEL_KLASORU, "bert_best_model")
+artifact_paths = []
+for root, _, files in os.walk(hf_directory):
+    artifact_paths.extend(os.path.join(root, filename) for filename in files)
+for path in sorted(artifact_paths):
+    relative_path = os.path.relpath(path, hf_directory).replace(os.sep, "/")
+    file_hash = hashlib.sha256()
+    with open(path, "rb") as artifact_file:
+        for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
+            file_hash.update(chunk)
+    hf_directory_hash.update(relative_path.encode("utf-8"))
+    hf_directory_hash.update(file_hash.digest())
+
+model_manifest = {
+    "model_version": f"bert-tr-v2-{datetime.utcnow().strftime('%Y%m%d')}",
+    "preprocessing_version": PREPROCESSING_VERSION,
+    "threshold": round(toxicity_threshold, 4),
+    "label_mapping": {"0": "clean", "1": "toxic"},
+    "training_data_version": "combined-tr-v2",
+    "validation_false_positive_rate": round(val_fpr, 6),
+    "validation_false_positives": val_fp,
+    "validation_false_negatives": val_fn,
+    "artifacts": {
+        "bert_best.pt": sha256.hexdigest(),
+        "bert_best_model": hf_directory_hash.hexdigest(),
+    },
+    "tokenizer_path": "bert_best_model",
+}
+manifest_path = os.path.join(MODEL_KLASORU, "model_manifest.json")
+with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+    json.dump(model_manifest, manifest_file, ensure_ascii=False, indent=2)
+
+# The API loads artefacts from backend_api. Deploy the complete HuggingFace
+# folder as well as the calibrated threshold so that runtime never falls back
+# to an unrelated tokenizer/model or a stale threshold.
+backend_model_dir = os.path.join(PROJE_KLASORU, "backend_api")
+if os.path.isdir(backend_model_dir):
+    shutil.copy2(os.path.join(MODEL_KLASORU, "bert_best.pt"), backend_model_dir)
+    shutil.copy2(threshold_path, backend_model_dir)
+    shutil.copy2(manifest_path, backend_model_dir)
+    shutil.copytree(
+        os.path.join(MODEL_KLASORU, "bert_best_model"),
+        os.path.join(backend_model_dir, "bert_best_model"),
+        dirs_exist_ok=True,
+    )
+    print(f"   API model artefacts deployed: {backend_model_dir}")
+
 all_preds, all_labels, all_probs = [], [], []
 with torch.no_grad():
     for batch in test_loader:
@@ -799,7 +961,10 @@ with torch.no_grad():
         all_labels.extend(labels.cpu().numpy())
         all_probs.extend(probs.cpu().numpy())
 
-bert_sonuc = performans_raporu_ciz(np.array(all_labels), np.array(all_preds), np.array(all_probs), 'BERT')
+calibrated_preds = (np.array(all_probs) >= toxicity_threshold).astype(int)
+bert_sonuc = performans_raporu_ciz(
+    np.array(all_labels), calibrated_preds, np.array(all_probs), 'BERT_Calibrated'
+)
 
 
 # ============================================================================
@@ -812,19 +977,10 @@ print("=" * 60)
 
 # Her modelin tahmin olasılıklarını ağırlıklı ortala
 # F1-score'a göre ağırlık ver
-f1_scores = {
-    'lstm': lstm_sonuc['f1_score'],
-    'bilstm': bilstm_sonuc['f1_score'],
-    'cnn': cnn_sonuc['f1_score'],
-    'bert': bert_sonuc['f1_score']
-}
-
-# Ağırlıkları normalize et
-toplam_f1 = sum(f1_scores.values())
-weights = {k: v / toplam_f1 for k, v in f1_scores.items()}
-print(f"   Ağırlıklar (F1 bazlı):")
-for k, v in weights.items():
-    print(f"     {k:8s}: {v:.3f} (F1={f1_scores[k]:.4f})")
+# Test sonuçlarından ağırlık seçmek test sızıntısı oluşturur. Validation
+# tabanlı ayrı bir optimizasyon eklenene kadar önceden belirlenmiş eşit ağırlık.
+weights = {'lstm': 0.25, 'bilstm': 0.25, 'cnn': 0.25, 'bert': 0.25}
+print("   Ensemble ağırlıkları: eşit ağırlık (test sızıntısı yok)")
 
 # Ağırlıklı ensemble
 ensemble_prob = (
@@ -874,6 +1030,8 @@ plt.savefig(os.path.join(SONUC_KLASORU, 'model_karsilastirma.png'), dpi=150, bbo
 plt.show()
 
 df_sonuc.to_csv(os.path.join(SONUC_KLASORU, 'model_karsilastirma.csv'), index=False)
+with open(os.path.join(SONUC_KLASORU, 'model_metrics.json'), 'w', encoding='utf-8') as metrics_file:
+    json.dump(tum_sonuclar, metrics_file, ensure_ascii=False, indent=2)
 
 en_iyi = df_sonuc.loc[df_sonuc['f1_score'].idxmax()]
 print(f"\n🏆 EN İYİ MODEL: {en_iyi['model']}")
@@ -936,31 +1094,38 @@ if IN_COLAB:
     try:
         from google.colab import drive
         import shutil
-        
+
         print("Google Drive'a bağlanılıyor. (Ekrana çıkan pencereden izin verin)")
         drive.mount('/content/drive')
-        
+
         hedef_klasor = '/content/drive/MyDrive/saldirgan_icerik_projesi'
         hedef_sonuc = os.path.join(hedef_klasor, 'sonuclar')
         hedef_model = os.path.join(hedef_klasor, 'modeller')
         hedef_veri = os.path.join(hedef_klasor, 'veri_setleri')
-        
+
         os.makedirs(hedef_sonuc, exist_ok=True)
         os.makedirs(hedef_model, exist_ok=True)
         os.makedirs(hedef_veri, exist_ok=True)
-        
+
         print("Grafikler ve sonuçlar kopyalanıyor...")
         for dosya in os.listdir(SONUC_KLASORU):
             shutil.copy(os.path.join(SONUC_KLASORU, dosya), os.path.join(hedef_sonuc, dosya))
-            
+
         print("Eğitilmiş modeller kopyalanıyor...")
         for dosya in os.listdir(MODEL_KLASORU):
-            shutil.copy(os.path.join(MODEL_KLASORU, dosya), os.path.join(hedef_model, dosya))
-            
-        print("Temizlenmiş eğitim veri seti kopyalanıyor...")
-        if os.path.exists(DATASET_PATH):
-            shutil.copy(DATASET_PATH, os.path.join(hedef_veri, 'turkish_toxic_language_temiz.csv'))
-            
+            kaynak = os.path.join(MODEL_KLASORU, dosya)
+            hedef = os.path.join(hedef_model, dosya)
+            if os.path.isdir(kaynak):
+                shutil.copytree(kaynak, hedef, dirs_exist_ok=True)
+            else:
+                shutil.copy2(kaynak, hedef)
+
+        print("Eğitim veri setleri kopyalanıyor...")
+        for dosya in ('train.csv', 'valid.csv', 'test.csv'):
+            kaynak = os.path.join(VERI_KLASORU, dosya)
+            if os.path.exists(kaynak):
+                shutil.copy2(kaynak, os.path.join(hedef_veri, dosya))
+
         print(f"\n✅ BAŞARILI! Tüm dosyalar Google Drive hesabında '{hedef_klasor}' klasörüne güvenle kaydedildi.")
     except Exception as e:
         print("\n❌ Drive yedeklemesi sırasında bir hata oluştu:")

@@ -35,3 +35,8 @@ desktop.ini
 venv/
 env/
 .env
+.venv/
+*.db
+.coverage
+htmlcov/
+.pytest_cache/

@@ -1,0 +1,16 @@
+{
+  "model_version": "bert-tr-v2-2026-07-11",
+  "preprocessing_version": "turkish-toxic-v2",
+  "threshold": 0.8,
+  "label_mapping": {
+    "0": "clean",
+    "1": "toxic"
+  },
+  "training_data_version": "combined-tr-v2",
+  "validation_false_positive_rate": 0.01,
+  "artifacts": {
+    "bert_best.pt": "MODEL_DOSYASININ_SHA256_DEGERI",
+    "bert_best_model": "MODEL_KLASORUNUN_SHA256_DEGERI"
+  },
+  "tokenizer_path": "bert_best_model"
+}

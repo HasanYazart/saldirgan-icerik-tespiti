@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Saldırgan İçerik Tespiti</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <p class="eyebrow">Güvenli iletişim laboratuvarı</p>
+      <h1>Saldırgan İçerik Tespiti</h1>
+      <p class="subtitle">Türkçe metinler için kural tabanlı analiz ve BERT sınıflandırması.</p>
+      <span id="health" class="chip">Sistem kontrol ediliyor…</span>
+    </header>
+
+    <section id="authPanel" class="panel auth-grid">
+      <form id="loginForm">
+        <h2>Giriş yap</h2>
+        <label>Kullanıcı adı<input id="loginUsername" autocomplete="username" required></label>
+        <label>Parola<input id="loginPassword" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Giriş yap</button>
+      </form>
+      <form id="registerForm">
+        <h2>Hesap oluştur</h2>
+        <label>Kullanıcı adı<input id="registerUsername" minlength="3" maxlength="64" required></label>
+        <label>Parola<input id="registerPassword" type="password" minlength="10" required></label>
+        <button type="submit" class="secondary">Kayıt ol</button>
+      </form>
+    </section>
+
+    <section id="appPanel" class="panel hidden">
+      <div class="row between">
+        <p id="userInfo"></p>
+        <button id="logoutButton" class="ghost">Çıkış</button>
+      </div>
+      <form id="analyzeForm">
+        <label for="message">Analiz edilecek mesaj</label>
+        <textarea id="message" maxlength="2000" rows="5" required></textarea>
+        <div class="row between"><small id="counter">0 / 2000</small><button type="submit">Analiz et</button></div>
+      </form>
+      <div id="result" class="result hidden" aria-live="polite"></div>
+      <form id="appealForm" class="hidden">
+        <h2>Karara itiraz et</h2>
+        <label>İtiraz gerekçesi<textarea id="appealReason" minlength="10" maxlength="1000" rows="3" required></textarea></label>
+        <button type="submit" class="secondary">İtirazı gönder</button>
+      </form>
+    </section>
+    <section id="adminPanel" class="panel hidden">
+      <div class="row between"><h2>Moderasyon paneli</h2><button id="refreshAdmin" class="ghost">Yenile</button></div>
+      <h3>İnceleme kuyruğu</h3>
+      <div id="reviewQueue" class="queue"></div>
+      <h3>Açık itirazlar</h3>
+      <div id="appealQueue" class="queue"></div>
+    </section>
+    <p id="notice" class="notice" aria-live="polite"></p>
+  </main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

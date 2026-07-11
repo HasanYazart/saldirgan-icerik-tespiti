@@ -30,6 +30,13 @@ import seaborn as sns
 from collections import Counter
 from sklearn.model_selection import train_test_split
 
+SCRIPT_KLASORU = os.path.dirname(os.path.abspath(__file__))
+PROJE_KLASORU = os.path.abspath(os.path.join(SCRIPT_KLASORU, ".."))
+if PROJE_KLASORU not in sys.path:
+    sys.path.insert(0, PROJE_KLASORU)
+
+from backend_api.text_processing import normalize_for_model
+
 warnings.filterwarnings('ignore')
 
 # Türkçe karakter desteği için
@@ -48,12 +55,12 @@ plt.rcParams['figure.dpi'] = 100
 # ============================================================================
 
 # Dosya yolları
-VERI_KLASORU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "veri setleri ve url")
-CIKTI_KLASORU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temiz_veri")
-GRAFIK_KLASORU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grafikler")
+VERI_KLASORU = os.getenv("RAW_DATA_DIR", os.path.join(PROJE_KLASORU, "ham_veri"))
+CIKTI_KLASORU = os.path.join(PROJE_KLASORU, "veri_setleri")
+GRAFIK_KLASORU = os.path.join(PROJE_KLASORU, "grafikler")
 
 # Temizleme parametreleri
-MIN_KELIME_SAYISI = 3        # Bu sayıdan az kelime içeren satırları çıkar
+MIN_KELIME_SAYISI = 1        # Kısa sosyal medya mesajları kritik örneklerdir
 MAX_KARAKTER_SAYISI = 1500   # Bu sayıdan fazla karakter kırpılır
 TEST_ORANI = 0.15            # Test seti oranı
 VALID_ORANI = 0.10           # Validation seti oranı
@@ -87,36 +94,7 @@ def metin_temizle(text):
     if pd.isna(text) or not isinstance(text, str):
         return ""
     
-    # URL'leri kaldır
-    text = re.sub(r'http[s]?://\S+', '', text)
-    text = re.sub(r'www\.\S+', '', text)
-    
-    # @mention'ları kaldır
-    text = re.sub(r'@\w+', '', text)
-    
-    # RT etiketini kaldır
-    text = re.sub(r'\bRT\b', '', text)
-    
-    # #hashtag -> hashtag (# işaretini kaldır, kelimeyi koru)
-    text = re.sub(r'#(\w+)', r'\1', text)
-    
-    # Emoji ve özel karakterleri kaldır (Türkçe harfleri koru)
-    # Türkçe özel karakterler: çÇğĞıİöÖşŞüÜ
-    text = re.sub(r'[^a-zA-ZçÇğĞıİöÖşŞüÜ0-9\s]', ' ', text)
-    
-    # Sayıları kaldır (opsiyonel - metinsel analiz için genelde sayılar gereksiz)
-    text = re.sub(r'\d+', '', text)
-    
-    # Fazla boşlukları tek boşluğa düşür
-    text = re.sub(r'\s+', ' ', text)
-    
-    # Baş ve son boşlukları temizle
-    text = text.strip()
-    
-    # Küçük harfe çevir
-    text = text.lower()
-    
-    return text
+    return normalize_for_model(text)
 
 
 def kelime_say(text):
@@ -294,6 +272,15 @@ df_birlesik.rename(columns={'text_temiz': 'text'}, inplace=True)
 
 # Birleşik duplikatları çıkar
 onceki = len(df_birlesik)
+etiket_sayilari = df_birlesik.groupby('text')['label'].nunique()
+celiskili_metinler = etiket_sayilari[etiket_sayilari > 1].index
+if len(celiskili_metinler):
+    klasor_olustur(CIKTI_KLASORU)
+    celiski_raporu = df_birlesik[df_birlesik['text'].isin(celiskili_metinler)].sort_values('text')
+    celiski_yolu = os.path.join(CIKTI_KLASORU, 'etiket_celiskileri.csv')
+    celiski_raporu.to_csv(celiski_yolu, index=False, encoding='utf-8')
+    raise ValueError(f"{len(celiskili_metinler)} çelişkili metin bulundu. İnceleyin: {celiski_yolu}")
+
 df_birlesik = df_birlesik.drop_duplicates(subset=['text']).copy()
 print(f"   Birleşik duplikat çıkarılan: {onceki - len(df_birlesik):,}")
 
@@ -315,15 +302,16 @@ print("  ADIM 7: TRAIN / TEST / VALIDATION SPLIT")
 print("=" * 70)
 
 # Stratified split (sınıf dengesi korunarak)
-X = df_birlesik['text']
+X = df_birlesik[['text', 'kaynak']]
 y = df_birlesik['label']
+strata = y.astype(str) + '_' + df_birlesik['kaynak'].astype(str)
 
 # Önce train+valid ve test ayır
 X_train_valid, X_test, y_train_valid, y_test = train_test_split(
     X, y,
     test_size=TEST_ORANI,
     random_state=RANDOM_SEED,
-    stratify=y
+    stratify=strata
 )
 
 # Sonra train ve valid ayır
@@ -332,7 +320,7 @@ X_train, X_valid, y_train, y_valid = train_test_split(
     X_train_valid, y_train_valid,
     test_size=valid_ratio_adjusted,
     random_state=RANDOM_SEED,
-    stratify=y_train_valid
+    stratify=(y_train_valid.astype(str) + '_' + X_train_valid['kaynak'].astype(str))
 )
 
 print(f"\n   📊 Bölümleme sonuçları:")
@@ -345,9 +333,9 @@ print(f"     0: {(y_train==0).sum():,} ({(y_train==0).mean()*100:.1f}%)")
 print(f"     1: {(y_train==1).sum():,} ({(y_train==1).mean()*100:.1f}%)")
 
 # DataFrame'leri oluştur
-df_train_final = pd.DataFrame({'text': X_train, 'label': y_train})
-df_valid_final = pd.DataFrame({'text': X_valid, 'label': y_valid})
-df_test_final  = pd.DataFrame({'text': X_test, 'label': y_test})
+df_train_final = X_train.copy(); df_train_final['label'] = y_train
+df_valid_final = X_valid.copy(); df_valid_final['label'] = y_valid
+df_test_final  = X_test.copy(); df_test_final['label'] = y_test
 
 
 # ============================================================================

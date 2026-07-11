@@ -1,0 +1,15 @@
+.git
+.github
+.env
+__pycache__
+*.pyc
+*.pt
+*.pth
+*.db
+.pytest_cache
+.coverage
+htmlcov
+sonuclar
+modeller
+veri_setleri
+grafikler

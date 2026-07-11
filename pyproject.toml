@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turkish-toxic-content-detection"
+version = "3.0.0"
+description = "Türkçe sosyal medya metinleri için güvenli moderasyon API'si"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "alembic>=1.14,<2",
+  "bcrypt>=4.2,<5",
+  "cryptography>=44,<46",
+  "fastapi>=0.115,<1",
+  "PyJWT>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+  "sqlalchemy>=2.0,<3",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+ml = [
+  "torch>=2.5,<3",
+  "transformers>=4.48,<5",
+]
+training = [
+  "matplotlib>=3.9,<4",
+  "numpy>=2.0,<3",
+  "pandas>=2.2,<3",
+  "scikit-learn>=1.5,<2",
+  "seaborn>=0.13,<1",
+  "tensorflow>=2.18,<3",
+  "wordcloud>=1.9,<2",
+]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+]
+production = [
+  "psycopg[binary]>=3.2,<4",
+  "redis>=5,<7",
+]
+
+[tool.setuptools.packages.find]
+include = ["backend_api*"]
+
+[tool.setuptools.package-data]
+backend_api = ["static/*", "*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --disable-warnings --maxfail=1"
+
+[tool.coverage.run]
+source = ["backend_api"]
+omit = ["backend_api/debug.py", "backend_api/test_*.py"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
