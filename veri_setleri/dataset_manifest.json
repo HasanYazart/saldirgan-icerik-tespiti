@@ -1,9 +1,9 @@
 {
-  "data_version": "combined-2eb087907c28",
-  "preprocessing_version": "turkish-toxic-v2",
+  "data_version": "combined-ffe41484ec99",
+  "preprocessing_version": "belge3-word2vec-v1",
   "split_fingerprints": {
-    "test": "56c0a0db8e88f01fab332c304d16356d3c45804d735ba08aa1344c56c534bd57",
-    "valid": "063aa6d571343a59cf9b6a78694f71ed55f383b4201e31791a78c2d996009231",
-    "train": "b7c0bfc066545ddb873d42a702632156a7676f88f88f2e2eddef72fd33c36385"
+    "test": "841b7e946ef0aa6bcdf22dcf30baa4bc5ea16c1ef30741431ab87f25ba5ace00",
+    "valid": "3d2608dca36da7eff45c5c9adec81f1e667eb100a7b01fcd9d1497d43c4529ab",
+    "train": "e1e8c08bc5272642d9bf521627d1e4246f54830ed9998033831c693f0045e483"
   }
 }

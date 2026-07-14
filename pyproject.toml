@@ -26,6 +26,7 @@ ml = [
   "transformers>=4.48,<5",
 ]
 training = [
+  "gensim>=4.4,<5",
   "matplotlib>=3.9,<4",
   "numpy>=2.0,<3",
   "pandas>=2.2,<3",
@@ -36,6 +37,7 @@ training = [
 ]
 colab = [
   "accelerate>=1.2,<2",
+  "gensim>=4.4,<5",
   "matplotlib>=3.9,<4",
   "numpy>=2.0,<3",
   "pandas>=2.2,<3",

@@ -37,7 +37,10 @@ WORKSPACE_DIR = PROJECT_DIR.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from backend_api.text_processing import PREPROCESSING_VERSION, normalize_for_model
+from veri_temizlemesi_ve_egitimi.document_preprocessing import (
+    PREPROCESSING_VERSION,
+    normalize_for_document,
+)
 
 
 TEXT_ALIASES = (
@@ -516,7 +519,7 @@ class TurkishToxicDataCleaner:
                     return ""
                 raw_value = str(value).strip()
                 if group_column_id in TEXTUAL_GROUP_ALIASES:
-                    normalized_value = normalize_for_model(raw_value)
+                    normalized_value = normalize_for_document(raw_value)
                 else:
                     normalized_value = raw_value.casefold()
                 return source + ":" + hashlib.blake2b(
@@ -527,9 +530,7 @@ class TurkishToxicDataCleaner:
                 stable_group_value
             )
         standardized["label"] = standardized["raw_label"].map(self._parse_label)
-        standardized["text"] = standardized["raw_text"].map(
-            lambda value: normalize_for_model(value) if isinstance(value, str) else ""
-        )
+        standardized["text"] = standardized["raw_text"].map(normalize_for_document)
         standardized["kelime_sayisi"] = standardized["text"].str.split().str.len()
 
         reasons = np.full(len(standardized), "", dtype=object)

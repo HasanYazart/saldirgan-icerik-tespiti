@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
-"""Keras + Transformer + validation ağırlıklı ensemble eğitim pipeline'ı.
+"""Belge (3) uyumlu Word2Vec + CNN/LSTM ve BERT eğitim pipeline'ı.
 
 Öne çıkan korumalar:
   * tokenizer/vectorizer yalnızca train ile öğrenilir;
   * model ve eşik seçimi yalnızca validation üzerinde yapılır;
-  * test split'e eğitim/kalibrasyon/ensemble ağırlığı seçiminde dokunulmaz;
-  * Keras'ta on-the-fly token dropout, AdamW, L2, label smoothing, early stop;
+  * test split'e eğitim, kalibrasyon veya model seçiminde dokunulmaz;
+  * Word2Vec yalnızca train metinleriyle öğrenilir;
+  * belgede önerilen CNN -> LSTM hibrit mimarisi uygulanır;
+  * Keras'ta token dropout, AdamW, L2, label smoothing ve early stopping;
   * Transformer'da focal loss, AdamW, cosine schedule, warmup, gradient
     checkpointing, mixed precision ve desteklenen GPU'larda torch.compile;
-  * olasılık kalibrasyonu ve hedef yanlış-pozitif oranına bağlı eşik;
-  * ensemble ağırlıkları validation F1 değerlerinden türetilir.
+  * olasılık kalibrasyonu ve hedef yanlış-pozitif oranına bağlı eşik.
 
 Colab:
     !pip install -e ".[colab]"
-    !python veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py --prepare-data --models bert
+    !python veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py --prepare-data --models lstm,cnn,cnn_lstm
 """
 
 from __future__ import annotations
@@ -56,7 +57,11 @@ PROJECT_DIR = SCRIPT_DIR.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from backend_api.text_processing import PREPROCESSING_VERSION, normalize_for_model
+from backend_api.text_processing import PREPROCESSING_VERSION as BACKEND_PREPROCESSING_VERSION
+from veri_temizlemesi_ve_egitimi.document_preprocessing import (
+    PREPROCESSING_VERSION,
+    normalize_for_document,
+)
 
 
 try:
@@ -125,13 +130,21 @@ def frame_fingerprint(frame: pd.DataFrame) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def stable_token_hash(token: str) -> int:
+    """Word2Vec başlangıç vektörlerini süreçler arasında tekrarlanabilir yapar."""
+
+    return int.from_bytes(
+        hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest(), "little"
+    )
+
+
 @dataclass(slots=True)
 class TrainingConfig:
     project_dir: Path = PROJECT_DIR
     data_dir: Path | None = None
     result_dir: Path | None = None
     model_dir: Path | None = None
-    models: tuple[str, ...] = ("lstm", "bilstm", "cnn", "bert")
+    models: tuple[str, ...] = ("lstm", "cnn", "cnn_lstm")
     seed: int = 42
     target_false_positive_rate: float = 0.01
     deploy_backend: bool = False
@@ -140,6 +153,9 @@ class TrainingConfig:
     max_tokens: int = 50_000
     sequence_length: int = 192
     embedding_dim: int = 192
+    word2vec_window: int = 5
+    word2vec_min_count: int = 2
+    word2vec_epochs: int = 10
     recurrent_units: int = 96
     cnn_filters: int = 192
     dropout: float = 0.45
@@ -177,11 +193,13 @@ class TrainingConfig:
         if self.resume_from_checkpoint not in (None, "auto"):
             self.resume_from_checkpoint = Path(self.resume_from_checkpoint).resolve()
         self.models = tuple(name.strip().lower() for name in self.models if name.strip())
-        unknown = set(self.models) - {"lstm", "bilstm", "cnn", "bert"}
+        unknown = set(self.models) - {"lstm", "cnn", "cnn_lstm", "bert"}
         if unknown:
             raise ValueError(f"Bilinmeyen modeller: {sorted(unknown)}")
         if not 0 < self.target_false_positive_rate < 1:
             raise ValueError("target_false_positive_rate 0-1 arasında olmalı")
+        if self.word2vec_epochs < 1 or self.word2vec_min_count < 1:
+            raise ValueError("Word2Vec epochs ve min_count en az 1 olmalı")
         if not self.models:
             raise ValueError("En az bir model seçilmeli")
 
@@ -227,9 +245,7 @@ class TrainingDataModule:
                 frame["text"] = frame["text"].fillna("").astype(str)
             else:
                 # Eski, manifestsiz splitler icin geriye uyumluluk.
-                frame["text"] = frame["text"].map(
-                    lambda value: normalize_for_model(value) if isinstance(value, str) else ""
-                )
+                frame["text"] = frame["text"].map(normalize_for_document)
             frame["label"] = pd.to_numeric(frame["label"], errors="raise").astype("int8")
             if not set(frame["label"].unique()).issubset({0, 1}):
                 raise ValueError(f"{path}: etiketler yalnızca 0/1 olabilir")
@@ -398,6 +414,15 @@ def calculate_metrics(
     probabilities = np.asarray(probabilities, dtype=np.float64)
     predictions = (probabilities >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
+    per_class_precision = precision_score(
+        labels, predictions, labels=[0, 1], average=None, zero_division=0
+    )
+    per_class_recall = recall_score(
+        labels, predictions, labels=[0, 1], average=None, zero_division=0
+    )
+    per_class_f1 = f1_score(
+        labels, predictions, labels=[0, 1], average=None, zero_division=0
+    )
     metrics = {
         "threshold": float(threshold),
         "accuracy": float(accuracy_score(labels, predictions)),
@@ -408,6 +433,16 @@ def calculate_metrics(
         "mcc": float(matthews_corrcoef(labels, predictions)),
         "false_positive_rate": float(fp / max(fp + tn, 1)),
         "false_negative_rate": float(fn / max(fn + tp, 1)),
+        "class_0_precision": float(per_class_precision[0]),
+        "class_0_recall": float(per_class_recall[0]),
+        "class_0_f1": float(per_class_f1[0]),
+        "class_1_precision": float(per_class_precision[1]),
+        "class_1_recall": float(per_class_recall[1]),
+        "class_1_f1": float(per_class_f1[1]),
+        "true_negatives": int(tn),
+        "false_positives": int(fp),
+        "false_negatives": int(fn),
+        "true_positives": int(tp),
         "pr_auc": float(average_precision_score(labels, probabilities)),
         "brier": float(brier_score_loss(labels, probabilities)),
         "ece": expected_calibration_error(labels, probabilities),
@@ -422,8 +457,6 @@ def calculate_metrics(
 @dataclass(slots=True)
 class PredictionBundle:
     model_name: str
-    validation_probabilities: np.ndarray
-    test_probabilities: np.ndarray
     temperature: float
     threshold: float
     validation_metrics: dict[str, float]
@@ -453,8 +486,6 @@ class BaseModelTrainer:
         )
         return PredictionBundle(
             model_name=model_name,
-            validation_probabilities=calibrated_validation,
-            test_probabilities=calibrated_test,
             temperature=scaler.temperature,
             threshold=threshold,
             validation_metrics=calculate_metrics(validation_labels, calibrated_validation, threshold),
@@ -463,14 +494,97 @@ class BaseModelTrainer:
         )
 
 
-class KerasModelTrainer(BaseModelTrainer):
-    """String girişli, kaydedilebilir LSTM/BiLSTM/multi-kernel CNN eğiticisi."""
+@dataclass(slots=True)
+class KerasTextResources:
+    vectorizer: Any
+    embedding_matrix: np.ndarray
 
-    def __init__(self, config: TrainingConfig, data: TrainingDataModule, model_name: str) -> None:
+
+class KerasModelTrainer(BaseModelTrainer):
+    """Belgedeki Word2Vec, LSTM, CNN ve CNN->LSTM modellerini eğitir."""
+
+    def __init__(
+        self,
+        config: TrainingConfig,
+        data: TrainingDataModule,
+        model_name: str,
+        resource_cache: dict[str, KerasTextResources],
+    ) -> None:
         super().__init__(config, data)
         self.model_name = model_name
+        self.resource_cache = resource_cache
 
-    def _build_model(self, tf: Any, vectorizer: Any) -> Any:
+    def _build_text_resources(self, tf: Any) -> KerasTextResources:
+        try:
+            from gensim.models import Word2Vec
+        except ImportError as exc:
+            raise RuntimeError(
+                "Belge (3) Word2Vec adımı için gensim kurun: pip install -e '.[training]'"
+            ) from exc
+
+        sentences = [
+            text.split()
+            for text in self.data.train["text"].astype(str)
+            if str(text).strip()
+        ]
+        print(f"Word2Vec yalnızca train üzerinde eğitiliyor: {len(sentences):,} metin")
+        word2vec = Word2Vec(
+            sentences=sentences,
+            vector_size=self.config.embedding_dim,
+            window=self.config.word2vec_window,
+            min_count=self.config.word2vec_min_count,
+            workers=1,
+            sg=1,
+            negative=10,
+            epochs=self.config.word2vec_epochs,
+            seed=self.config.seed,
+            hashfxn=stable_token_hash,
+            max_final_vocab=max(self.config.max_tokens - 2, 100),
+        )
+        vocabulary = word2vec.wv.index_to_key[: self.config.max_tokens - 2]
+        vectorizer = tf.keras.layers.TextVectorization(
+            vocabulary=vocabulary,
+            output_mode="int",
+            output_sequence_length=self.config.sequence_length,
+            standardize=None,
+            split="whitespace",
+            name="train_only_word2vec_vectorizer",
+        )
+        keras_vocabulary = vectorizer.get_vocabulary()
+        embedding_matrix = np.zeros(
+            (len(keras_vocabulary), self.config.embedding_dim), dtype=np.float32
+        )
+        if vocabulary:
+            embedding_matrix[1] = np.mean(
+                word2vec.wv.vectors[: len(vocabulary)], axis=0
+            )
+        for index, token in enumerate(keras_vocabulary[2:], start=2):
+            embedding_matrix[index] = word2vec.wv[token]
+
+        metadata = {
+            "method": "Word2Vec skip-gram",
+            "trained_on": "train_only",
+            "vocabulary_size": len(keras_vocabulary),
+            "vector_size": self.config.embedding_dim,
+            "window": self.config.word2vec_window,
+            "min_count": self.config.word2vec_min_count,
+            "epochs": self.config.word2vec_epochs,
+            "workers": 1,
+            "seed": self.config.seed,
+        }
+        (self.config.result_dir / "word2vec_config.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        del word2vec
+        gc.collect()
+        return KerasTextResources(vectorizer, embedding_matrix)
+
+    def _resources(self, tf: Any) -> KerasTextResources:
+        if "document_word2vec" not in self.resource_cache:
+            self.resource_cache["document_word2vec"] = self._build_text_resources(tf)
+        return self.resource_cache["document_word2vec"]
+
+    def _build_model(self, tf: Any, resources: KerasTextResources) -> Any:
         layers = tf.keras.layers
         regularizers = tf.keras.regularizers
         config = self.config
@@ -498,38 +612,33 @@ class KerasModelTrainer(BaseModelTrainer):
                 return {**super().get_config(), "rate": self.rate}
 
         text_input = layers.Input(shape=(), dtype=tf.string, name="text")
-        token_ids = vectorizer(text_input)
+        token_ids = resources.vectorizer(text_input)
         token_ids = TokenDropout(config.token_dropout, name="token_dropout")(token_ids)
         embedding = layers.Embedding(
-            input_dim=len(vectorizer.get_vocabulary()),
+            input_dim=resources.embedding_matrix.shape[0],
             output_dim=config.embedding_dim,
-            mask_zero=True,
-            embeddings_regularizer=regularizers.l2(config.l2_regularization),
-            name="embedding",
+            weights=[resources.embedding_matrix],
+            trainable=False,
+            mask_zero=False,
+            name="train_only_word2vec_embedding",
         )(token_ids)
         x = layers.SpatialDropout1D(config.dropout * 0.65)(embedding)
         regularizer = regularizers.l2(config.l2_regularization)
 
-        if self.model_name in {"lstm", "bilstm"}:
-            recurrent = layers.LSTM(
+        if self.model_name == "lstm":
+            x = layers.LSTM(
                 config.recurrent_units,
                 return_sequences=True,
+                dropout=config.dropout * 0.45,
+                recurrent_dropout=0.0,
                 kernel_regularizer=regularizer,
                 recurrent_regularizer=regularizer,
-                name="recurrent_encoder",
-            )
-            x = layers.Bidirectional(recurrent, name="bidirectional")(x) if self.model_name == "bilstm" else recurrent(x)
-            attention = layers.MultiHeadAttention(
-                num_heads=4,
-                key_dim=max(config.recurrent_units // 4, 16),
-                dropout=config.dropout * 0.5,
-                name="self_attention",
-            )(x, x)
-            x = layers.LayerNormalization()(x + attention)
+                name="lstm_encoder",
+            )(x)
             x = layers.Concatenate()(
                 [layers.GlobalMaxPooling1D()(x), layers.GlobalAveragePooling1D()(x)]
             )
-        else:
+        elif self.model_name == "cnn":
             branches = []
             for kernel_size in (2, 3, 4, 5):
                 branch = layers.Conv1D(
@@ -542,6 +651,28 @@ class KerasModelTrainer(BaseModelTrainer):
                 branch = layers.GlobalMaxPooling1D()(branch)
                 branches.append(branch)
             x = layers.Concatenate(name="multi_kernel_features")(branches)
+        else:  # Belge (3)'te önerilen CNN -> RNN/LSTM hibrit modeli.
+            x = layers.Conv1D(
+                config.cnn_filters,
+                kernel_size=3,
+                padding="same",
+                activation="relu",
+                kernel_regularizer=regularizer,
+                name="local_ngram_cnn",
+            )(x)
+            x = layers.MaxPooling1D(pool_size=2, name="cnn_max_pooling")(x)
+            x = layers.LSTM(
+                config.recurrent_units,
+                return_sequences=True,
+                dropout=config.dropout * 0.45,
+                recurrent_dropout=0.0,
+                kernel_regularizer=regularizer,
+                recurrent_regularizer=regularizer,
+                name="long_term_lstm",
+            )(x)
+            x = layers.Concatenate(name="hybrid_features")(
+                [layers.GlobalMaxPooling1D()(x), layers.GlobalAveragePooling1D()(x)]
+            )
 
         x = layers.Dense(128, activation="swish", kernel_regularizer=regularizer)(x)
         x = layers.BatchNormalization()(x)
@@ -575,6 +706,38 @@ class KerasModelTrainer(BaseModelTrainer):
             dataset = dataset.shuffle(min(len(frame), 50_000), seed=seed, reshuffle_each_iteration=True)
         return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
+    def _save_history(self, history: Any) -> None:
+        values = {
+            key: [float(value) for value in series]
+            for key, series in history.history.items()
+        }
+        (self.config.result_dir / f"{self.model_name}_history.json").write_text(
+            json.dumps(values, indent=2), encoding="utf-8"
+        )
+
+        import matplotlib.pyplot as plt
+
+        figure, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        axes[0].plot(values.get("loss", []), label="Train")
+        axes[0].plot(values.get("val_loss", []), label="Validation")
+        axes[0].set_title(f"{self.model_name.upper()} kayıp")
+        axes[0].set_xlabel("Epoch")
+        axes[0].legend()
+        axes[0].grid(alpha=0.25)
+        axes[1].plot(values.get("accuracy", []), label="Train")
+        axes[1].plot(values.get("val_accuracy", []), label="Validation")
+        axes[1].set_title(f"{self.model_name.upper()} doğruluk")
+        axes[1].set_xlabel("Epoch")
+        axes[1].legend()
+        axes[1].grid(alpha=0.25)
+        figure.tight_layout()
+        figure.savefig(
+            self.config.result_dir / f"{self.model_name}_egitim.png",
+            dpi=160,
+            bbox_inches="tight",
+        )
+        plt.close(figure)
+
     def train(self) -> PredictionBundle:
         try:
             import tensorflow as tf
@@ -595,18 +758,8 @@ class KerasModelTrainer(BaseModelTrainer):
         except (AttributeError, RuntimeError):
             pass
 
-        vectorizer = tf.keras.layers.TextVectorization(
-            max_tokens=self.config.max_tokens,
-            output_mode="int",
-            output_sequence_length=self.config.sequence_length,
-            standardize=None,
-            split="whitespace",
-            name="train_only_vectorizer",
-        )
-        vectorizer.adapt(
-            tf.data.Dataset.from_tensor_slices(self.data.train["text"].astype(str).to_numpy()).batch(512)
-        )
-        model = self._build_model(tf, vectorizer)
+        resources = self._resources(tf)
+        model = self._build_model(tf, resources)
         model.summary()
 
         artifact = self.config.model_dir / f"{self.model_name}_best.keras"
@@ -637,14 +790,7 @@ class KerasModelTrainer(BaseModelTrainer):
             class_weight=self.data.class_weights(),
             verbose=2,
         )
-        history_path = self.config.result_dir / f"{self.model_name}_history.json"
-        history_path.write_text(
-            json.dumps(
-                {key: [float(value) for value in values] for key, values in history.history.items()},
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        self._save_history(history)
         validation_probs = model.predict(
             self._dataset(tf, self.data.valid, self.config.keras_batch_size, False, self.config.seed),
             verbose=0,
@@ -909,67 +1055,22 @@ class TransformerModelTrainer(BaseModelTrainer):
         manifest_path = self.config.model_dir / "model_manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         if self.config.deploy_backend:
+            if PREPROCESSING_VERSION != BACKEND_PREPROCESSING_VERSION:
+                raise RuntimeError(
+                    "Belge (3) ön işlemesi backend tarafından henüz uygulanmıyor; "
+                    "uyumsuz modeli otomatik dağıtmak güvenli değil."
+                )
             backend_dir = self.config.project_dir / "backend_api"
             shutil.copy2(state_path, backend_dir / state_path.name)
             shutil.copy2(manifest_path, backend_dir / manifest_path.name)
             shutil.copytree(hf_dir, backend_dir / hf_dir.name, dirs_exist_ok=True)
 
 
-class ValidationWeightedEnsemble:
-    """Model ağırlığı ve karar eşiğini yalnızca validation üzerinde öğrenir."""
-
-    def __init__(self, target_fpr: float) -> None:
-        self.target_fpr = target_fpr
-
-    def combine(
-        self,
-        bundles: Sequence[PredictionBundle],
-        validation_labels: np.ndarray,
-        test_labels: np.ndarray,
-        output_path: Path,
-    ) -> PredictionBundle:
-        if len(bundles) < 2:
-            raise ValueError("Ensemble için en az iki model gerekli")
-        scores = np.array([max(bundle.validation_metrics["f1"], 1e-3) for bundle in bundles])
-        # Dördüncü kuvvet iyi model farkını belirginleştirir, tek modele çökmez.
-        weights = scores**4
-        weights /= weights.sum()
-        validation_probs = sum(
-            weight * bundle.validation_probabilities for weight, bundle in zip(weights, bundles)
-        )
-        test_probs = sum(weight * bundle.test_probabilities for weight, bundle in zip(weights, bundles))
-        scaler = TemperatureScaler().fit(validation_probs, validation_labels)
-        validation_probs = scaler.transform(validation_probs)
-        test_probs = scaler.transform(test_probs)
-        threshold, _ = ThresholdOptimizer(self.target_fpr).select(
-            validation_probs, validation_labels
-        )
-        config = {
-            "weights": {
-                bundle.model_name: float(weight) for bundle, weight in zip(bundles, weights)
-            },
-            "weight_source": "validation_f1_power_4",
-            "temperature": scaler.temperature,
-            "threshold": threshold,
-            "target_false_positive_rate": self.target_fpr,
-        }
-        output_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-        return PredictionBundle(
-            model_name="ensemble",
-            validation_probabilities=validation_probs,
-            test_probabilities=test_probs,
-            temperature=scaler.temperature,
-            threshold=threshold,
-            validation_metrics=calculate_metrics(validation_labels, validation_probs, threshold),
-            test_metrics=calculate_metrics(test_labels, test_probs, threshold),
-            artifact=str(output_path),
-        )
-
-
 class TrainingPipeline:
     def __init__(self, config: TrainingConfig) -> None:
         self.config = config
         self.data = TrainingDataModule(config)
+        self.keras_resource_cache: dict[str, KerasTextResources] = {}
 
     def dry_run(self) -> dict[str, Any]:
         self.data.load()
@@ -1006,20 +1107,14 @@ class TrainingPipeline:
             if model_name == "bert":
                 bundle = TransformerModelTrainer(self.config, self.data).train()
             else:
-                bundle = KerasModelTrainer(self.config, self.data, model_name).train()
+                bundle = KerasModelTrainer(
+                    self.config,
+                    self.data,
+                    model_name,
+                    self.keras_resource_cache,
+                ).train()
             bundles.append(bundle)
             self._save_intermediate_results(bundles)
-
-        if len(bundles) > 1:
-            ensemble = ValidationWeightedEnsemble(
-                self.config.target_false_positive_rate
-            ).combine(
-                bundles,
-                self.data.valid["label"].to_numpy(),
-                self.data.test["label"].to_numpy(),
-                self.config.model_dir / "ensemble_config.json",
-            )
-            bundles.append(ensemble)
 
         self._save_intermediate_results(bundles)
         self._print_results(bundles)
@@ -1053,8 +1148,7 @@ class TrainingPipeline:
                 f"test PR-AUC={bundle.test_metrics['pr_auc']:.4f} "
                 f"eşik={bundle.threshold:.3f}"
             )
-        selectable = [bundle for bundle in bundles if bundle.model_name != "ensemble"]
-        best = max(selectable, key=lambda bundle: bundle.validation_metrics["f1"])
+        best = max(bundles, key=lambda bundle: bundle.validation_metrics["f1"])
         print(f"\nValidation'a göre en iyi tek model: {best.model_name}")
 
 
@@ -1110,7 +1204,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", type=Path, default=None)
     parser.add_argument("--result-dir", type=Path, default=None)
     parser.add_argument("--model-dir", type=Path, default=None)
-    parser.add_argument("--models", default="lstm,bilstm,cnn,bert")
+    parser.add_argument("--models", default="lstm,cnn,cnn_lstm")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--target-fpr", type=float, default=0.01)
     parser.add_argument("--bert-model", default="dbmdz/bert-base-turkish-cased")
@@ -1118,6 +1212,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bert-batch-size", type=int, default=16)
     parser.add_argument("--keras-epochs", type=int, default=30)
     parser.add_argument("--keras-batch-size", type=int, default=64)
+    parser.add_argument("--word2vec-epochs", type=int, default=10)
     parser.add_argument(
         "--prepare-data",
         action="store_true",
@@ -1183,6 +1278,7 @@ def main(argv: Sequence[str] | None = None) -> Any:
         transformer_batch_size=args.bert_batch_size,
         keras_epochs=args.keras_epochs,
         keras_batch_size=args.keras_batch_size,
+        word2vec_epochs=args.word2vec_epochs,
         torch_compile=args.torch_compile,
         gradient_checkpointing=not args.no_gradient_checkpointing,
         resume_from_checkpoint=args.resume_from_checkpoint,

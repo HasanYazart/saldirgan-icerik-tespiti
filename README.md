@@ -158,20 +158,21 @@ hızlı doğrulama için model indirmeden şu komut çalıştırılabilir:
 python veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py --dry-run
 ```
 
-Eğitim pipeline'ı Keras LSTM/BiLSTM/multi-kernel CNN ve Türkçe BERT'i destekler.
-Keras tarafında train-only `TextVectorization`, on-the-fly token dropout, AdamW,
-L2, label smoothing ve early stopping; BERT tarafında Focal Loss, warmup+cosine
-schedule, gradient checkpointing, mixed precision ve istenirse desteklenen GPU'larda
-`torch.compile` kullanılır. Kalibrasyon, eşik ve ensemble ağırlıkları yalnızca
-validation verisinden öğrenilir; test verisi sadece bir kez nihai raporda kullanılır.
+Eğitim pipeline'ı Belge (3)'teki LSTM, CNN ve önerilen CNN→LSTM mimarisini uygular.
+Keras modelleri yalnızca train metinleriyle öğrenilen Word2Vec vektörlerini paylaşır.
+Overfitting'e karşı dondurulmuş Word2Vec, token/SpatialDropout, L2, label smoothing,
+sınıf ağırlığı, gradient clipping, early stopping ve öğrenme oranı düşürme kullanılır.
+Türkçe BERT, transfer öğrenme karşılaştırması olarak ayrıca çalıştırılabilir. Model
+seçimi ve eşik yalnızca validation verisinden öğrenilir; test verisi yalnızca nihai
+raporda kullanılır.
 
 Google Colab için hazır hücreler ve T4 ayarları: [COLAB_CALISTIRMA.md](COLAB_CALISTIRMA.md).
 
 Yalnızca seçili modeller de eğitilebilir:
 
 ```powershell
+python veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py --models lstm,cnn,cnn_lstm
 python veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py --models bert
-python veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py --models lstm,bilstm,cnn
 ```
 
 ## API özeti

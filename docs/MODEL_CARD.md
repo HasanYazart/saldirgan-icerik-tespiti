@@ -9,7 +9,8 @@ Türkçe sosyal medya metinlerinde saldırgan veya toksik içerik olasılığı 
 - Taban model: `dbmdz/bert-base-turkish-cased`
 - Görev: İkili sınıflandırma (`0=clean`, `1=toxic`)
 - En uzun dizi: varsayılan 160 token (manifestte sürümlenir)
-- Ön işleme: `turkish-toxic-v2`
+- Belge deneyi ön işlemesi: `belge3-word2vec-v1`
+- Ana modeller: train-only Word2Vec + LSTM, CNN ve CNN→LSTM
 - Olasılık kalibrasyonu: validation NLL ile temperature scaling
 - Karar eşiği: yalnızca validation bölümünde hedef yanlış pozitif oranı altında en yüksek F1'e göre seçilir
 
