@@ -45,8 +45,10 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
     matthews_corrcoef,
+    precision_recall_curve,
     precision_score,
     recall_score,
+    roc_curve,
     roc_auc_score,
 )
 from sklearn.utils.class_weight import compute_class_weight
@@ -484,6 +486,14 @@ class BaseModelTrainer:
         threshold, _ = ThresholdOptimizer(self.config.target_false_positive_rate).select(
             calibrated_validation, validation_labels
         )
+        self._save_evaluation_plots(
+            model_name,
+            validation_labels,
+            calibrated_validation,
+            test_labels,
+            calibrated_test,
+            threshold,
+        )
         return PredictionBundle(
             model_name=model_name,
             temperature=scaler.temperature,
@@ -492,6 +502,190 @@ class BaseModelTrainer:
             test_metrics=calculate_metrics(test_labels, calibrated_test, threshold),
             artifact=str(artifact),
         )
+
+    def _save_evaluation_plots(
+        self,
+        model_name: str,
+        validation_labels: np.ndarray,
+        validation_probabilities: np.ndarray,
+        test_labels: np.ndarray,
+        test_probabilities: np.ndarray,
+        threshold: float,
+    ) -> None:
+        """Kalibrasyon ve test değerlendirmesinden üretilebilen tanı grafiklerini kaydet."""
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        plot_dir = self.config.result_dir / "grafikler"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        sns.set_theme(style="whitegrid", context="notebook")
+        display_name = model_name.upper()
+
+        def save(figure: Any, suffix: str) -> None:
+            figure.tight_layout()
+            figure.savefig(
+                plot_dir / f"{model_name}_{suffix}.png",
+                dpi=170,
+                bbox_inches="tight",
+            )
+            plt.close(figure)
+
+        predictions = (test_probabilities >= threshold).astype(np.int8)
+        matrix = confusion_matrix(test_labels, predictions, labels=[0, 1])
+        normalized = matrix / np.maximum(matrix.sum(axis=1, keepdims=True), 1)
+        figure, axes = plt.subplots(1, 2, figsize=(12, 5))
+        sns.heatmap(
+            matrix,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            cbar=False,
+            xticklabels=["Temiz", "Saldırgan"],
+            yticklabels=["Temiz", "Saldırgan"],
+            ax=axes[0],
+        )
+        axes[0].set_title(f"{display_name} test karmaşıklık matrisi")
+        axes[0].set_xlabel("Tahmin")
+        axes[0].set_ylabel("Gerçek")
+        sns.heatmap(
+            normalized,
+            annot=True,
+            fmt=".1%",
+            cmap="Blues",
+            vmin=0,
+            vmax=1,
+            cbar=False,
+            xticklabels=["Temiz", "Saldırgan"],
+            yticklabels=["Temiz", "Saldırgan"],
+            ax=axes[1],
+        )
+        axes[1].set_title("Satır-normalize karmaşıklık matrisi")
+        axes[1].set_xlabel("Tahmin")
+        axes[1].set_ylabel("Gerçek")
+        save(figure, "01_confusion_matrix")
+
+        figure, ax = plt.subplots(figsize=(7, 6))
+        for labels, probabilities, split_name in (
+            (validation_labels, validation_probabilities, "Validation"),
+            (test_labels, test_probabilities, "Test"),
+        ):
+            fpr, tpr, _ = roc_curve(labels, probabilities)
+            score = roc_auc_score(labels, probabilities)
+            ax.plot(fpr, tpr, linewidth=2, label=f"{split_name} (AUC={score:.4f})")
+        ax.plot([0, 1], [0, 1], "--", color="gray", label="Rastgele")
+        ax.set(xlabel="Yanlış pozitif oranı", ylabel="Doğru pozitif oranı")
+        ax.set_title(f"{display_name} ROC eğrisi")
+        ax.legend()
+        save(figure, "02_roc_curve")
+
+        figure, ax = plt.subplots(figsize=(7, 6))
+        for labels, probabilities, split_name in (
+            (validation_labels, validation_probabilities, "Validation"),
+            (test_labels, test_probabilities, "Test"),
+        ):
+            precision, recall, _ = precision_recall_curve(labels, probabilities)
+            score = average_precision_score(labels, probabilities)
+            ax.plot(recall, precision, linewidth=2, label=f"{split_name} (AP={score:.4f})")
+        ax.set(xlabel="Recall", ylabel="Precision", xlim=(0, 1), ylim=(0, 1.02))
+        ax.set_title(f"{display_name} precision-recall eğrisi")
+        ax.legend()
+        save(figure, "03_precision_recall_curve")
+
+        figure, axes = plt.subplots(1, 2, figsize=(13, 5))
+        bins = np.linspace(0.0, 1.0, 11)
+        bin_ids = np.minimum(np.digitize(test_probabilities, bins[1:-1]), 9)
+        predicted_means: list[float] = []
+        observed_means: list[float] = []
+        counts: list[int] = []
+        for bin_index in range(10):
+            mask = bin_ids == bin_index
+            if mask.any():
+                predicted_means.append(float(test_probabilities[mask].mean()))
+                observed_means.append(float(test_labels[mask].mean()))
+                counts.append(int(mask.sum()))
+        axes[0].plot([0, 1], [0, 1], "--", color="gray", label="İdeal")
+        axes[0].plot(predicted_means, observed_means, marker="o", label=display_name)
+        axes[0].set(
+            title="Kalibrasyon (güvenilirlik) eğrisi",
+            xlabel="Ortalama tahmin olasılığı",
+            ylabel="Gerçek saldırgan oranı",
+            xlim=(0, 1),
+            ylim=(0, 1),
+        )
+        axes[0].legend()
+        axes[1].bar(range(len(counts)), counts, color="#4c72b0")
+        axes[1].set_title("Kalibrasyon kutularındaki örnek sayısı")
+        axes[1].set_xlabel("Dolu olasılık kutusu")
+        axes[1].set_ylabel("Örnek")
+        save(figure, "04_calibration_curve")
+
+        figure, ax = plt.subplots(figsize=(9, 5))
+        probability_frame = pd.DataFrame(
+            {
+                "Saldırgan olasılığı": test_probabilities,
+                "Gerçek sınıf": np.where(test_labels == 1, "Saldırgan", "Temiz"),
+            }
+        )
+        sns.histplot(
+            data=probability_frame,
+            x="Saldırgan olasılığı",
+            hue="Gerçek sınıf",
+            bins=50,
+            stat="density",
+            common_norm=False,
+            element="step",
+            ax=ax,
+        )
+        ax.axvline(threshold, color="black", linestyle="--", label=f"Eşik={threshold:.3f}")
+        ax.set_title(f"{display_name} test olasılık dağılımı")
+        ax.legend()
+        save(figure, "05_probability_distribution")
+
+        threshold_grid = np.linspace(0.01, 0.99, 99)
+        precision_values: list[float] = []
+        recall_values: list[float] = []
+        f1_values: list[float] = []
+        fpr_values: list[float] = []
+        for candidate in threshold_grid:
+            candidate_predictions = (validation_probabilities >= candidate).astype(np.int8)
+            tn, fp, fn, tp = confusion_matrix(
+                validation_labels, candidate_predictions, labels=[0, 1]
+            ).ravel()
+            precision_values.append(
+                float(precision_score(validation_labels, candidate_predictions, zero_division=0))
+            )
+            recall_values.append(
+                float(recall_score(validation_labels, candidate_predictions, zero_division=0))
+            )
+            f1_values.append(
+                float(f1_score(validation_labels, candidate_predictions, zero_division=0))
+            )
+            fpr_values.append(float(fp / max(fp + tn, 1)))
+        figure, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(threshold_grid, precision_values, label="Precision")
+        ax.plot(threshold_grid, recall_values, label="Recall")
+        ax.plot(threshold_grid, f1_values, label="F1")
+        ax.plot(threshold_grid, fpr_values, label="FPR")
+        ax.axvline(threshold, color="black", linestyle="--", label=f"Seçilen eşik={threshold:.3f}")
+        ax.axhline(
+            self.config.target_false_positive_rate,
+            color="#c44e52",
+            linestyle=":",
+            label=f"Hedef FPR={self.config.target_false_positive_rate:.3f}",
+        )
+        ax.set(
+            title=f"{display_name} validation eşik analizi",
+            xlabel="Karar eşiği",
+            ylabel="Skor / oran",
+            xlim=(0, 1),
+            ylim=(0, 1.02),
+        )
+        ax.legend(ncol=2)
+        save(figure, "06_threshold_analysis")
 
 
 @dataclass(slots=True)
@@ -715,25 +909,38 @@ class KerasModelTrainer(BaseModelTrainer):
             json.dumps(values, indent=2), encoding="utf-8"
         )
 
+        import matplotlib
+
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        figure, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-        axes[0].plot(values.get("loss", []), label="Train")
-        axes[0].plot(values.get("val_loss", []), label="Validation")
-        axes[0].set_title(f"{self.model_name.upper()} kayıp")
-        axes[0].set_xlabel("Epoch")
-        axes[0].legend()
-        axes[0].grid(alpha=0.25)
-        axes[1].plot(values.get("accuracy", []), label="Train")
-        axes[1].plot(values.get("val_accuracy", []), label="Validation")
-        axes[1].set_title(f"{self.model_name.upper()} doğruluk")
-        axes[1].set_xlabel("Epoch")
-        axes[1].legend()
-        axes[1].grid(alpha=0.25)
+        plot_dir = self.config.result_dir / "grafikler"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        figure, axes = plt.subplots(2, 3, figsize=(16, 9))
+        metric_titles = (
+            ("loss", "Kayıp"),
+            ("accuracy", "Doğruluk"),
+            ("precision", "Precision"),
+            ("recall", "Recall"),
+            ("roc_auc", "ROC-AUC"),
+            ("pr_auc", "PR-AUC"),
+        )
+        for axis, (metric, title) in zip(axes.flat, metric_titles):
+            axis.plot(values.get(metric, []), marker="o", markersize=3, label="Train")
+            axis.plot(
+                values.get(f"val_{metric}", []),
+                marker="o",
+                markersize=3,
+                label="Validation",
+            )
+            axis.set_title(f"{self.model_name.upper()} {title}")
+            axis.set_xlabel("Epoch")
+            axis.legend()
+            axis.grid(alpha=0.25)
         figure.tight_layout()
         figure.savefig(
-            self.config.result_dir / f"{self.model_name}_egitim.png",
-            dpi=160,
+            plot_dir / f"{self.model_name}_00_egitim_gecmisi.png",
+            dpi=170,
             bbox_inches="tight",
         )
         plt.close(figure)
@@ -899,6 +1106,67 @@ class TransformerModelTrainer(BaseModelTrainer):
         exponentials = np.exp(logits)
         return exponentials[:, 1] / exponentials.sum(axis=1)
 
+    def _save_trainer_history(self, trainer: Any) -> None:
+        rows = list(trainer.state.log_history)
+        if not rows:
+            return
+        history_frame = pd.DataFrame(rows)
+        history_frame.to_csv(
+            self.config.result_dir / "bert_history.csv", index=False, encoding="utf-8"
+        )
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        plot_dir = self.config.result_dir / "grafikler"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        figure, axes = plt.subplots(2, 2, figsize=(14, 9))
+
+        train_rows = history_frame.dropna(subset=["loss"]) if "loss" in history_frame else pd.DataFrame()
+        eval_rows = (
+            history_frame.dropna(subset=["eval_loss"])
+            if "eval_loss" in history_frame
+            else pd.DataFrame()
+        )
+        if not train_rows.empty:
+            axes[0, 0].plot(train_rows["step"], train_rows["loss"], label="Train")
+        if not eval_rows.empty:
+            axes[0, 0].plot(eval_rows["step"], eval_rows["eval_loss"], marker="o", label="Validation")
+        axes[0, 0].set_title("BERT kayıp")
+        axes[0, 0].set_xlabel("Adım")
+        axes[0, 0].legend()
+
+        for metric, label in (("eval_accuracy", "Doğruluk"), ("eval_f1", "F1")):
+            if metric in history_frame:
+                metric_rows = history_frame.dropna(subset=[metric])
+                axes[0, 1].plot(metric_rows["step"], metric_rows[metric], marker="o", label=label)
+        axes[0, 1].set_title("BERT validation sınıflandırma metrikleri")
+        axes[0, 1].set_xlabel("Adım")
+        axes[0, 1].legend()
+
+        for metric, label in (("eval_roc_auc", "ROC-AUC"), ("eval_pr_auc", "PR-AUC")):
+            if metric in history_frame:
+                metric_rows = history_frame.dropna(subset=[metric])
+                axes[1, 0].plot(metric_rows["step"], metric_rows[metric], marker="o", label=label)
+        axes[1, 0].set_title("BERT validation alan metrikleri")
+        axes[1, 0].set_xlabel("Adım")
+        axes[1, 0].legend()
+
+        if "learning_rate" in history_frame:
+            learning_rows = history_frame.dropna(subset=["learning_rate"])
+            axes[1, 1].plot(learning_rows["step"], learning_rows["learning_rate"])
+        axes[1, 1].set_title("BERT öğrenme oranı")
+        axes[1, 1].set_xlabel("Adım")
+        for axis in axes.flat:
+            axis.grid(alpha=0.25)
+        figure.tight_layout()
+        figure.savefig(
+            plot_dir / "bert_00_egitim_gecmisi.png", dpi=170, bbox_inches="tight"
+        )
+        plt.close(figure)
+
     def train(self) -> PredictionBundle:
         try:
             import torch
@@ -1012,6 +1280,7 @@ class TransformerModelTrainer(BaseModelTrainer):
             resume_checkpoint = str(checkpoint_path)
             print(f"Checkpoint'ten devam ediliyor: {resume_checkpoint}")
         trainer.train(resume_from_checkpoint=resume_checkpoint)
+        self._save_trainer_history(trainer)
 
         hf_dir = self.config.model_dir / "bert_best_model"
         trainer.save_model(str(hf_dir))
@@ -1137,6 +1406,120 @@ class TrainingPipeline:
         (self.config.result_dir / "model_metrics.json").write_text(
             json.dumps(details, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
         )
+        self._save_comparison_plots(bundles)
+
+    def _save_comparison_plots(self, bundles: Sequence[PredictionBundle]) -> None:
+        if not bundles:
+            return
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        plot_dir = self.config.result_dir / "grafikler"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        sns.set_theme(style="whitegrid", context="notebook")
+        model_names = [bundle.model_name.upper() for bundle in bundles]
+
+        def save(figure: Any, filename: str) -> None:
+            figure.tight_layout()
+            figure.savefig(plot_dir / filename, dpi=170, bbox_inches="tight")
+            plt.close(figure)
+
+        core_metrics = ("accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc")
+        metric_labels = ("Accuracy", "Precision", "Recall", "F1", "ROC-AUC", "PR-AUC")
+        figure, axes = plt.subplots(1, 2, figsize=(17, 6), sharey=True)
+        x_positions = np.arange(len(model_names))
+        width = 0.8 / len(core_metrics)
+        for split_name, axis in (("validation", axes[0]), ("test", axes[1])):
+            for metric_index, (metric, label) in enumerate(zip(core_metrics, metric_labels)):
+                values = [
+                    getattr(bundle, f"{split_name}_metrics").get(metric, np.nan)
+                    for bundle in bundles
+                ]
+                offset = (metric_index - (len(core_metrics) - 1) / 2) * width
+                axis.bar(x_positions + offset, values, width=width, label=label)
+            axis.set_xticks(x_positions, model_names)
+            axis.set_ylim(0, 1.05)
+            axis.set_title(f"{split_name.title()} model karşılaştırması")
+            axis.set_ylabel("Skor")
+        axes[1].legend(ncol=2, bbox_to_anchor=(1.02, 1), loc="upper left")
+        save(figure, "00_model_skor_karsilastirmasi.png")
+
+        error_frame = pd.DataFrame(
+            {
+                "Model": model_names,
+                "Yanlış pozitif oranı": [
+                    bundle.test_metrics["false_positive_rate"] for bundle in bundles
+                ],
+                "Yanlış negatif oranı": [
+                    bundle.test_metrics["false_negative_rate"] for bundle in bundles
+                ],
+            }
+        ).melt(id_vars="Model", var_name="Hata", value_name="Oran")
+        figure, axes = plt.subplots(1, 2, figsize=(14, 5))
+        sns.barplot(data=error_frame, x="Model", y="Oran", hue="Hata", ax=axes[0])
+        axes[0].axhline(
+            self.config.target_false_positive_rate,
+            color="black",
+            linestyle="--",
+            label="Hedef FPR",
+        )
+        axes[0].set_title("Test hata oranları")
+        calibration_frame = pd.DataFrame(
+            {
+                "Model": model_names,
+                "Brier": [bundle.test_metrics["brier"] for bundle in bundles],
+                "ECE": [bundle.test_metrics["ece"] for bundle in bundles],
+            }
+        ).melt(id_vars="Model", var_name="Metrik", value_name="Değer")
+        sns.barplot(data=calibration_frame, x="Model", y="Değer", hue="Metrik", ax=axes[1])
+        axes[1].set_title("Test kalibrasyon hataları (düşük daha iyi)")
+        save(figure, "00_model_hata_ve_kalibrasyon.png")
+
+        class_metric_frame = pd.DataFrame(
+            [
+                {
+                    "Model": bundle.model_name.upper(),
+                    "Temiz Precision": bundle.test_metrics["class_0_precision"],
+                    "Temiz Recall": bundle.test_metrics["class_0_recall"],
+                    "Temiz F1": bundle.test_metrics["class_0_f1"],
+                    "Saldırgan Precision": bundle.test_metrics["class_1_precision"],
+                    "Saldırgan Recall": bundle.test_metrics["class_1_recall"],
+                    "Saldırgan F1": bundle.test_metrics["class_1_f1"],
+                }
+                for bundle in bundles
+            ]
+        ).set_index("Model")
+        figure, ax = plt.subplots(
+            figsize=(12, max(4, 0.8 * len(class_metric_frame)))
+        )
+        sns.heatmap(
+            class_metric_frame,
+            annot=True,
+            fmt=".3f",
+            cmap="YlGnBu",
+            vmin=0,
+            vmax=1,
+            ax=ax,
+        )
+        ax.set_title("Test sınıf bazlı metrikler")
+        save(figure, "00_model_sinif_bazli_metrikler.png")
+
+        figure, axes = plt.subplots(1, 2, figsize=(13, 5))
+        threshold_bars = axes[0].bar(
+            model_names, [bundle.threshold for bundle in bundles], color="#4c72b0"
+        )
+        axes[0].bar_label(threshold_bars, fmt="%.3f")
+        axes[0].set(title="Validation ile seçilen karar eşiği", ylim=(0, 1.05))
+        temperature_bars = axes[1].bar(
+            model_names, [bundle.temperature for bundle in bundles], color="#dd8452"
+        )
+        axes[1].bar_label(temperature_bars, fmt="%.3f")
+        axes[1].set_title("Olasılık kalibrasyonu sıcaklığı")
+        save(figure, "00_model_esik_ve_sicaklik.png")
 
     @staticmethod
     def _print_results(bundles: Sequence[PredictionBundle]) -> None:

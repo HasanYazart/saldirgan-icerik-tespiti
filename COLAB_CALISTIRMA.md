@@ -152,7 +152,17 @@ Bellek yetmezse `--bert-batch-size 8` kullanın. Bağlantı kesilirse:
 - `sonuclar/word2vec_config.json`: Word2Vec deney ayarları
 - `modeller/*_best.keras`: en iyi Keras checkpointleri
 - `sonuclar/veri_kalitesi/`: temizleme ve veri kalite raporları
-- `grafikler/`: veri dağılımı grafikleri
+- `grafikler/`: sınıf/kaynak/split dağılımları, metin ve kelime uzunlukları,
+  sık kelimeler, sınıf bazlı WordCloud, kaynak-sınıf oranları, yakın-kopya
+  grupları ve veri temizleme kalite grafikleri
+- `sonuclar/grafikler/`: her model için altı panelli eğitim geçmişi,
+  karmaşıklık matrisi, ROC, precision-recall, kalibrasyon, olasılık dağılımı
+  ve karar eşiği analizi; ayrıca modeller arası skor, hata, kalibrasyon,
+  sınıf metriği, eşik ve sıcaklık karşılaştırmaları
+
+Notebook'taki sonuç hücresi bu iki klasördeki bütün PNG dosyalarını otomatik
+bulup ekranda gösterir. Sonraki isteğe bağlı hücre bunları
+`belge3_tum_grafikler.zip` içinde toplar.
 
 Model seçimini validation F1 ile yapın. Test sonuçlarını yalnızca nihai model
 belirlendikten sonra tezde raporlayın.

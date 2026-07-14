@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from fractions import Fraction
@@ -727,22 +728,36 @@ class TurkishToxicDataCleaner:
             )
 
     def _generate_plots(self, combined: pd.DataFrame, splits: dict[str, pd.DataFrame]) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import seaborn as sns
 
         plot_dir = self.config.project_dir / "grafikler"
         plot_dir.mkdir(parents=True, exist_ok=True)
-        sns.set_theme(style="whitegrid")
+        sns.set_theme(style="whitegrid", context="notebook")
+        plt.rcParams["font.family"] = "DejaVu Sans"
+
+        def save(figure: object, filename: str) -> None:
+            figure.tight_layout()
+            figure.savefig(plot_dir / filename, dpi=170, bbox_inches="tight")
+            plt.close(figure)
+
+        plot_frame = combined[["text", "label", "kaynak", "group_id"]].copy()
+        plot_frame["sinif"] = plot_frame["label"].map({0: "Temiz", 1: "Saldırgan"})
+        plot_frame["karakter_sayisi"] = plot_frame["text"].str.len()
+        plot_frame["kelime_sayisi"] = plot_frame["text"].str.split().str.len()
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        sns.countplot(data=combined, x="label", ax=axes[0], hue="label", legend=False)
+        sns.countplot(data=plot_frame, x="sinif", ax=axes[0], hue="sinif", legend=False)
         axes[0].set_title("Sınıf dağılımı")
-        source_counts = combined["kaynak"].value_counts().head(15)
-        sns.barplot(x=source_counts.values, y=source_counts.index, ax=axes[1])
+        for container in axes[0].containers:
+            axes[0].bar_label(container, fmt="%.0f")
+        source_counts = plot_frame["kaynak"].value_counts().head(15)
+        sns.barplot(x=source_counts.values, y=source_counts.index, ax=axes[1], color="#4c72b0")
         axes[1].set_title("Kaynak dağılımı")
-        fig.tight_layout()
-        fig.savefig(plot_dir / "01_veri_dagilimi.png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
+        save(fig, "01_sinif_ve_kaynak_dagilimi.png")
 
         split_frame = pd.concat(
             [part.assign(split=name) for name, part in splits.items()], ignore_index=True
@@ -750,9 +765,161 @@ class TurkishToxicDataCleaner:
         fig, ax = plt.subplots(figsize=(9, 5))
         sns.countplot(data=split_frame, x="split", hue="label", ax=ax)
         ax.set_title("Split ve sınıf dağılımı")
-        fig.tight_layout()
-        fig.savefig(plot_dir / "02_split_dagilimi.png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
+        ax.legend(title="Etiket", labels=["Temiz", "Saldırgan"])
+        for container in ax.containers:
+            ax.bar_label(container, fmt="%.0f")
+        save(fig, "02_split_dagilimi.png")
+
+        character_limit = max(float(plot_frame["karakter_sayisi"].quantile(0.99)), 1)
+        fig, ax = plt.subplots(figsize=(11, 5))
+        sns.histplot(
+            data=plot_frame[plot_frame["karakter_sayisi"] <= character_limit],
+            x="karakter_sayisi",
+            hue="sinif",
+            bins=60,
+            stat="density",
+            common_norm=False,
+            element="step",
+            ax=ax,
+        )
+        ax.set_title("Metin karakter uzunluğu dağılımı (%99 aralık)")
+        save(fig, "03_metin_karakter_uzunlugu.png")
+
+        word_limit = max(float(plot_frame["kelime_sayisi"].quantile(0.99)), 1)
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        sns.histplot(
+            data=plot_frame[plot_frame["kelime_sayisi"] <= word_limit],
+            x="kelime_sayisi",
+            hue="sinif",
+            bins=50,
+            stat="density",
+            common_norm=False,
+            element="step",
+            ax=axes[0],
+        )
+        axes[0].set_title("Kelime sayısı dağılımı (%99 aralık)")
+        sns.boxplot(
+            data=plot_frame[plot_frame["kelime_sayisi"] <= word_limit],
+            x="sinif",
+            y="kelime_sayisi",
+            hue="sinif",
+            legend=False,
+            ax=axes[1],
+        )
+        axes[1].set_title("Sınıfa göre kelime sayısı")
+        save(fig, "04_kelime_uzunlugu_histogram_boxplot.png")
+
+        overall_words = Counter(
+            token for text in plot_frame["text"] for token in str(text).split()
+        ).most_common(30)
+        fig, ax = plt.subplots(figsize=(10, 8))
+        if overall_words:
+            words, counts = zip(*reversed(overall_words))
+            ax.barh(words, counts, color="#55a868")
+        ax.set_title("En sık 30 kelime")
+        ax.set_xlabel("Frekans")
+        save(fig, "05_en_sik_kelimeler.png")
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        for label, axis, color in ((0, axes[0], "#4c72b0"), (1, axes[1], "#c44e52")):
+            counts = Counter(
+                token
+                for text in plot_frame.loc[plot_frame["label"] == label, "text"]
+                for token in str(text).split()
+            ).most_common(25)
+            if counts:
+                words, values = zip(*reversed(counts))
+                axis.barh(words, values, color=color)
+            axis.set_title(f"{('Temiz' if label == 0 else 'Saldırgan')} sınıfında sık kelimeler")
+        save(fig, "06_sinif_bazli_en_sik_kelimeler.png")
+
+        try:
+            from wordcloud import WordCloud
+
+            fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+            for label, axis, color_map in ((0, axes[0], "Blues"), (1, axes[1], "Reds")):
+                texts = plot_frame.loc[plot_frame["label"] == label, "text"]
+                if len(texts) > 50_000:
+                    texts = texts.sample(50_000, random_state=self.config.random_seed)
+                cloud = WordCloud(
+                    width=1200,
+                    height=700,
+                    background_color="white",
+                    colormap=color_map,
+                    max_words=250,
+                    collocations=False,
+                    random_state=self.config.random_seed,
+                ).generate(" ".join(texts.astype(str)))
+                axis.imshow(cloud, interpolation="bilinear")
+                axis.axis("off")
+                axis.set_title("Temiz WordCloud" if label == 0 else "Saldırgan WordCloud")
+            save(fig, "07_sinif_bazli_wordcloud.png")
+        except (ImportError, ValueError) as exc:
+            print(f"WordCloud üretilemedi: {exc}")
+
+        source_label = pd.crosstab(
+            plot_frame["kaynak"], plot_frame["sinif"], normalize="index"
+        )
+        fig, ax = plt.subplots(figsize=(10, max(4, 0.65 * len(source_label))))
+        sns.heatmap(source_label, annot=True, fmt=".1%", cmap="YlGnBu", ax=ax)
+        ax.set_title("Kaynak bazında sınıf oranları")
+        save(fig, "08_kaynak_sinif_oranlari.png")
+
+        source_absolute = pd.crosstab(plot_frame["kaynak"], plot_frame["sinif"])
+        fig, ax = plt.subplots(figsize=(11, max(4, 0.65 * len(source_absolute))))
+        source_absolute.plot(kind="barh", stacked=True, ax=ax, color=["#4c72b0", "#c44e52"])
+        ax.set_title("Kaynak bazında mutlak sınıf sayıları")
+        ax.set_xlabel("Satır")
+        save(fig, "09_kaynak_sinif_sayilari.png")
+
+        group_sizes = plot_frame.groupby("group_id").size()
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        sns.histplot(group_sizes.clip(upper=group_sizes.quantile(0.99)), bins=40, ax=axes[0])
+        axes[0].set_title("Yakın-kopya grup boyutu (%99 aralık)")
+        axes[0].set_xlabel("Gruptaki metin sayısı")
+        group_summary = pd.Series(
+            {
+                "Tekil grup": int((group_sizes == 1).sum()),
+                "Çoklu grup": int((group_sizes > 1).sum()),
+            }
+        )
+        axes[1].pie(group_summary.values, labels=group_summary.index, autopct="%1.1f%%")
+        axes[1].set_title("İçerik grupları")
+        save(fig, "10_yakin_kopya_gruplari.png")
+
+        file_quality = pd.DataFrame(self.file_reports)
+        if not file_quality.empty:
+            file_quality["dosya"] = file_quality["path"].map(lambda value: Path(value).name)
+            fig, ax = plt.subplots(figsize=(12, max(5, 0.7 * len(file_quality))))
+            file_quality.set_index("dosya")[["accepted_rows", "rejected_rows"]].plot(
+                kind="barh",
+                stacked=True,
+                color=["#55a868", "#c44e52"],
+                ax=ax,
+            )
+            ax.set_title("Dosya bazında kabul/reddedilme")
+            ax.set_xlabel("Satır")
+            save(fig, "11_dosya_kalite_ozeti.png")
+
+        rejected_count = sum(len(frame) for frame in self.rejected_frames)
+        quality_counts = pd.Series(
+            {
+                "Eğitime kabul": len(combined),
+                "Yinelenen kayıt": len(self.duplicates),
+                "Çelişkili metin": self.conflicts["text"].nunique()
+                if not self.conflicts.empty
+                else 0,
+                "Geçersiz/reddedilen": rejected_count,
+            }
+        )
+        fig, ax = plt.subplots(figsize=(10, 5))
+        bars = ax.bar(quality_counts.index, quality_counts.values, color=sns.color_palette("Set2", 4))
+        ax.bar_label(bars, fmt="%.0f")
+        ax.set_title("Veri temizleme kalite özeti")
+        ax.tick_params(axis="x", rotation=15)
+        save(fig, "12_temizleme_kalite_ozeti.png")
+
+        print(f"{len(list(plot_dir.glob('*.png')))} veri grafiği üretildi: {plot_dir}")
 
     def _build_audit(
         self,
