@@ -1,5 +1,8 @@
 # Google Colab'da Belge (3) yöntemine göre eğitim
 
+Doğrudan Colab'a yükleyip çalıştırabileceğiniz hazır notebook:
+[`BELGE3_COLAB.ipynb`](BELGE3_COLAB.ipynb)
+
 Ana deney, belgede karşılaştırılan `LSTM`, `CNN` ve önerilen `CNN → LSTM`
 modellerini kullanır. Kelime vektörleri yalnızca train splitinde öğrenilen Word2Vec
 ile oluşturulur. BERT, belgenin kuramsal bölümündeki transfer öğrenme karşılaştırması

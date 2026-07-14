@@ -166,7 +166,8 @@ Türkçe BERT, transfer öğrenme karşılaştırması olarak ayrıca çalışt�
 seçimi ve eşik yalnızca validation verisinden öğrenilir; test verisi yalnızca nihai
 raporda kullanılır.
 
-Google Colab için hazır hücreler ve T4 ayarları: [COLAB_CALISTIRMA.md](COLAB_CALISTIRMA.md).
+Google Colab için hazır notebook: [BELGE3_COLAB.ipynb](BELGE3_COLAB.ipynb).
+Ayrıntılı T4 ve hücre yönergesi: [COLAB_CALISTIRMA.md](COLAB_CALISTIRMA.md).
 
 Yalnızca seçili modeller de eğitilebilir:
 
