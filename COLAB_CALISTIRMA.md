@@ -22,11 +22,31 @@ import os
 
 drive.mount("/content/drive")
 
-# Drive'da farklı ad kullandıysanız yalnızca bu satırı değiştirin.
-PROJECT_ROOT = Path(
-    "/content/drive/MyDrive/DERİN ÖĞRENME YÖNTEMLERİ İLE SOSYAL MEDYADA SALDIRGAN İÇERİK TESPİTİ"
-)
-REPO_DIR = PROJECT_ROOT / "github_repo"
+# Klasör adı veya Drive konumu farklı olsa da projeyi otomatik bulur.
+MY_DRIVE = Path("/content/drive/MyDrive")
+repo_candidates = [
+    path for path in MY_DRIVE.rglob("github_repo")
+    if path.is_dir() and (path / "pyproject.toml").exists()
+]
+if not repo_candidates:
+    repo_candidates = [
+        path.parent for path in MY_DRIVE.rglob("pyproject.toml")
+        if (path.parent / "veri_temizlemesi_ve_egitimi").is_dir()
+    ]
+if not repo_candidates:
+    raise FileNotFoundError(
+        "Drive içinde github_repo bulunamadı. Proje ana klasörünü MyDrive'a yükleyin."
+    )
+
+def raw_data_score(repo_path):
+    parent = repo_path.parent
+    names = ["train_1.csv", "test_1.csv", "train_2.csv", "test_2.csv"]
+    return sum((parent / name).exists() for name in names) + 4 * (
+        parent / "veri setleri ve url"
+    ).is_dir()
+
+REPO_DIR = max(repo_candidates, key=raw_data_score)
+PROJECT_ROOT = REPO_DIR.parent
 os.chdir(REPO_DIR)
 
 required = [
