@@ -112,26 +112,67 @@ REDIS_URL=redis://redis:6379/0
 
 ## Veri hazırlama ve eğitim
 
-Ham veri dosyalarını varsayılan olarak `ham_veri/` içine koyun:
+Ham veri dosyalarını ve yeni simülasyon CSV'lerini varsayılan olarak `ham_veri/`
+içine koyun. Dosya adı serbesttir; pipeline `text/metin/message/content` ve
+`label/is_toxic/toxic/class/etiket` gibi yaygın sütun adlarını otomatik eşler:
 
 ```text
 ham_veri/
 ├── turkish_toxic_language.csv
 ├── train.csv
 ├── valid.csv
-└── test.csv
+├── test.csv
+└── simulasyon_10500.csv
 ```
 
 Başka konum için `RAW_DATA_DIR` ayarlanabilir.
 
+Mevcut çalışma alanında proje kökündeki `train_1/test_1/train_2/test_2.csv` ile
+`veri setleri ve url/` altındaki eski dosyalar ayrıca parametre vermeden birlikte
+keşfedilir. Yeni dosyalardaki `clean` etiketi `0`; `offensive`, `hate`, `threat`,
+`targeted_abuse` ve `sexual_profanity` etiketleri `1` olarak normalize edilir.
+`base_key` alanı aynı temel örnekten üretilen varyasyonları tek grupta tutar.
+
 ```powershell
-pip install -e ".[training]"
-python veri_temizlemesi_ve_egitimi/01_veri_temizleme.py
+pip install -e ".[training,ml]"
+python veri_temizlemesi_ve_egitimi/01_veri_temizleme.py --plots
 python tools/audit_dataset.py
 python veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py
 ```
 
-Temizleme betiği kısa mesajları korur, aynı metne verilmiş çelişkili etiketlerde işlemi durdurur ve kaynak+etiket dağılımını bölümler arasında korur. Eğitim betiği test verisini model/ensemble ağırlığı seçmek için kullanmaz.
+Birden çok ham veri klasörü de verilebilir:
+
+```powershell
+python veri_temizlemesi_ve_egitimi/01_veri_temizleme.py `
+  --input-dir ham_veri `
+  --input-dir "C:\veriler\eski_veriler"
+```
+
+Temizleme sınıfı kısa mesajları korur, geçersiz satırları ve etiket çelişkilerini
+kalite raporuna karantinaya alır. Birebir kopyaların yanında kelime sırası değişmiş
+veya tek kelimesi silinmiş sentetik türevleri de `group_id` ile aynı split'te
+tutar. Etiket+kaynak dağılımı `StratifiedGroupKFold` ile korunur. Eğitim öncesi
+hızlı doğrulama için model indirmeden şu komut çalıştırılabilir:
+
+```powershell
+python veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py --dry-run
+```
+
+Eğitim pipeline'ı Keras LSTM/BiLSTM/multi-kernel CNN ve Türkçe BERT'i destekler.
+Keras tarafında train-only `TextVectorization`, on-the-fly token dropout, AdamW,
+L2, label smoothing ve early stopping; BERT tarafında Focal Loss, warmup+cosine
+schedule, gradient checkpointing, mixed precision ve istenirse desteklenen GPU'larda
+`torch.compile` kullanılır. Kalibrasyon, eşik ve ensemble ağırlıkları yalnızca
+validation verisinden öğrenilir; test verisi sadece bir kez nihai raporda kullanılır.
+
+Google Colab için hazır hücreler ve T4 ayarları: [COLAB_CALISTIRMA.md](COLAB_CALISTIRMA.md).
+
+Yalnızca seçili modeller de eğitilebilir:
+
+```powershell
+python veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py --models bert
+python veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py --models lstm,bilstm,cnn
+```
 
 ## API özeti
 

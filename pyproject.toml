@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ml = [
+  "accelerate>=1.2,<2",
   "torch>=2.5,<3",
   "transformers>=4.48,<5",
 ]
@@ -31,6 +32,17 @@ training = [
   "scikit-learn>=1.5,<2",
   "seaborn>=0.13,<1",
   "tensorflow>=2.18,<3",
+  "wordcloud>=1.9,<2",
+]
+colab = [
+  "accelerate>=1.2,<2",
+  "matplotlib>=3.9,<4",
+  "numpy>=2.0,<3",
+  "pandas>=2.2,<3",
+  "scikit-learn>=1.5,<2",
+  "seaborn>=0.13,<1",
+  "torch>=2.5,<3",
+  "transformers>=4.48,<5",
   "wordcloud>=1.9,<2",
 ]
 dev = [
