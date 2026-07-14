@@ -1,0 +1,9 @@
+{
+  "data_version": "combined-ffe41484ec99",
+  "preprocessing_version": "belge3-word2vec-v1",
+  "split_fingerprints": {
+    "test": "841b7e946ef0aa6bcdf22dcf30baa4bc5ea16c1ef30741431ab87f25ba5ace00",
+    "valid": "3d2608dca36da7eff45c5c9adec81f1e667eb100a7b01fcd9d1497d43c4529ab",
+    "train": "e1e8c08bc5272642d9bf521627d1e4246f54830ed9998033831c693f0045e483"
+  }
+}

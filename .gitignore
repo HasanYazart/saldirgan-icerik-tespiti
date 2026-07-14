@@ -36,6 +36,7 @@ venv/
 env/
 .env
 .venv/
+.runtime/
 *.db
 .coverage
 htmlcov/

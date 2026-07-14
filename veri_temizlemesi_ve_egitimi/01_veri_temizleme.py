@@ -1,582 +1,1054 @@
 # -*- coding: utf-8 -*-
-"""
-===============================================================================
- DERİN ÖĞRENME YÖNTEMLERİ İLE SOSYAL MEDYADA SALDIRGAN İÇERİK TESPİTİ
- 01 - VERİ TEMİZLEME & KEŞİFSEL VERİ ANALİZİ (EDA)
-===============================================================================
+"""Türkçe saldırgan içerik verisi için sızıntı güvenli temizleme pipeline'ı.
 
-Bu script iki farklı Türkçe saldırgan içerik veri setini:
-  1. HuggingFace - turkish_toxic_language.csv  (~77.800 satır)
-  2. Kaggle - train.csv / test.csv / valid.csv  (~53.000 satır)
+Yeni ve eski CSV dosyalarını birlikte keşfeder, farklı sütun şemalarını tek bir
+şemaya dönüştürür ve içerik gruplarını bölmeden train/valid/test üretir.
 
-yükler, temizler, birleştirir ve eğitime hazır hale getirir.
-
-Çalıştırma:
-  python 01_veri_temizleme.py
-
-Gerekli kütüphaneler:
-  pip install pandas numpy matplotlib seaborn scikit-learn wordcloud
-===============================================================================
+Örnek:
+    python veri_temizlemesi_ve_egitimi/01_veri_temizleme.py --plots
+    python veri_temizlemesi_ve_egitimi/01_veri_temizleme.py \
+        --input-dir ham_veri --input-dir C:/veriler/simulasyon
 """
 
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
 import os
 import re
 import sys
-import warnings
+import unicodedata
+from collections import Counter
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from fractions import Fraction
+from pathlib import Path
+from typing import Iterable, Sequence
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from collections import Counter
-from sklearn.model_selection import train_test_split
-
-SCRIPT_KLASORU = os.path.dirname(os.path.abspath(__file__))
-PROJE_KLASORU = os.path.abspath(os.path.join(SCRIPT_KLASORU, ".."))
-if PROJE_KLASORU not in sys.path:
-    sys.path.insert(0, PROJE_KLASORU)
-
-from backend_api.text_processing import normalize_for_model
-
-warnings.filterwarnings('ignore')
-
-# Türkçe karakter desteği için
-try:
-    sys.stdout.reconfigure(encoding='utf-8')
-except:
-    pass
-
-# Matplotlib Türkçe karakter desteği
-plt.rcParams['font.family'] = 'DejaVu Sans'
-plt.rcParams['figure.figsize'] = (12, 6)
-plt.rcParams['figure.dpi'] = 100
-
-# ============================================================================
-# YAPILANDIRMA
-# ============================================================================
-
-# Dosya yolları
-VERI_KLASORU = os.getenv("RAW_DATA_DIR", os.path.join(PROJE_KLASORU, "ham_veri"))
-CIKTI_KLASORU = os.path.join(PROJE_KLASORU, "veri_setleri")
-GRAFIK_KLASORU = os.path.join(PROJE_KLASORU, "grafikler")
-
-# Temizleme parametreleri
-MIN_KELIME_SAYISI = 1        # Kısa sosyal medya mesajları kritik örneklerdir
-MAX_KARAKTER_SAYISI = 1500   # Bu sayıdan fazla karakter kırpılır
-TEST_ORANI = 0.15            # Test seti oranı
-VALID_ORANI = 0.10           # Validation seti oranı
-RANDOM_SEED = 42
-
-# ============================================================================
-# YARDIMCI FONKSİYONLAR
-# ============================================================================
-
-def klasor_olustur(klasor_yolu):
-    """Klasör yoksa oluşturur."""
-    os.makedirs(klasor_yolu, exist_ok=True)
-    print(f"  📁 Klasör hazır: {klasor_yolu}")
+from sklearn.model_selection import StratifiedGroupKFold
 
 
-def metin_temizle(text):
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+WORKSPACE_DIR = PROJECT_DIR.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from veri_temizlemesi_ve_egitimi.document_preprocessing import (
+    PREPROCESSING_VERSION,
+    normalize_for_document,
+)
+
+
+TEXT_ALIASES = (
+    "text",
+    "metin",
+    "message",
+    "mesaj",
+    "content",
+    "icerik",
+    "tweet",
+    "comment",
+    "yorum",
+    "sentence",
+    "cumle",
+)
+LABEL_ALIASES = (
+    "is_toxic",
+    "label",
+    "toxic",
+    "offensive",
+    "is_offensive",
+    "class",
+    "sinif",
+    "etiket",
+    "target",
+)
+GROUP_ALIASES = (
+    "base_key",
+    "original_text",
+    "root_text",
+    "parent_text",
+    "augmentation_group",
+    "conversation_id",
+    "thread_id",
+    "user_id",
+    "author_id",
+    "account_id",
+    "kullanici_id",
+    "grup_id",
+)
+POSITIVE_LABELS = {
+    "1",
+    "true",
+    "yes",
+    "evet",
+    "toxic",
+    "offensive",
+    "abusive",
+    "attack",
+    "hate",
+    "hakaret",
+    "saldirgan",
+    "saldırgan",
+    "nefret",
+    "insult",
+    "threat",
+    "profanity",
+    "targeted abuse",
+    "sexual profanity",
+    "targeted harassment",
+    "harassment",
+    "cyberbullying",
+    "off",
+    "label 1",
+}
+NEGATIVE_LABELS = {
+    "0",
+    "false",
+    "no",
+    "hayir",
+    "hayır",
+    "clean",
+    "normal",
+    "neutral",
+    "not toxic",
+    "non toxic",
+    "not offensive",
+    "non offensive",
+    "not",
+    "label 0",
+}
+SKIPPED_DIRECTORIES = {
+    ".git",
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    "modeller",
+    "sonuclar",
+    "grafikler",
+    "veri_setleri",
+    "temiz_veri",
+    ".runtime",
+    "reports",
+    "rapor",
+}
+
+TEXTUAL_GROUP_ALIASES = {
+    "base_key",
+    "original_text",
+    "root_text",
+    "parent_text",
+}
+AGREEMENT_ALIASES = ("agreement", "annotator_agreement", "uzlasma", "uyum")
+NOTES_ALIASES = ("notes", "note", "notlar", "aciklama")
+
+
+def _ascii_identifier(value: object) -> str:
+    value = unicodedata.normalize("NFKD", str(value).strip().lower())
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    return re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _frame_fingerprint(frame: pd.DataFrame) -> str:
+    columns = [column for column in ("text", "label", "kaynak", "group_id") if column in frame]
+    payload = frame[columns].sort_values(columns).to_csv(index=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(slots=True)
+class DataCleaningConfig:
+    """Veri temizleme ve split davranışını tek noktadan yönetir."""
+
+    project_dir: Path = PROJECT_DIR
+    input_dirs: tuple[Path, ...] = field(default_factory=tuple)
+    output_dir: Path | None = None
+    report_dir: Path | None = None
+    min_words: int = 1
+    max_characters: int = 1500
+    test_ratio: float = 0.15
+    valid_ratio: float = 0.10
+    random_seed: int = 42
+    conflict_policy: str = "quarantine"
+    group_near_duplicates: bool = True
+    near_duplicate_ratio: float = 0.90
+    generate_plots: bool = False
+
+    def __post_init__(self) -> None:
+        self.project_dir = Path(self.project_dir).resolve()
+        self.output_dir = Path(self.output_dir or self.project_dir / "veri_setleri").resolve()
+        self.report_dir = Path(self.report_dir or self.project_dir / "sonuclar" / "veri_kalitesi").resolve()
+        self.input_dirs = tuple(Path(path).resolve() for path in self.input_dirs)
+        if self.min_words < 1:
+            raise ValueError("min_words en az 1 olmalı")
+        if self.max_characters < 32:
+            raise ValueError("max_characters en az 32 olmalı")
+        if self.test_ratio <= 0 or self.valid_ratio <= 0:
+            raise ValueError("test_ratio ve valid_ratio pozitif olmalı")
+        if self.test_ratio + self.valid_ratio >= 0.5:
+            raise ValueError("Validation + test oranı 0.50'den küçük olmalı")
+        if self.conflict_policy not in {"quarantine", "error", "majority"}:
+            raise ValueError("conflict_policy: quarantine, error veya majority olmalı")
+
+
+class UnionFind:
+    def __init__(self, size: int) -> None:
+        self.parent = list(range(size))
+        self.rank = [0] * size
+
+    def find(self, item: int) -> int:
+        while self.parent[item] != item:
+            self.parent[item] = self.parent[self.parent[item]]
+            item = self.parent[item]
+        return item
+
+    def union(self, left: int, right: int) -> None:
+        left_root, right_root = self.find(left), self.find(right)
+        if left_root == right_root:
+            return
+        if self.rank[left_root] < self.rank[right_root]:
+            left_root, right_root = right_root, left_root
+        self.parent[right_root] = left_root
+        if self.rank[left_root] == self.rank[right_root]:
+            self.rank[left_root] += 1
+
+
+class ContentGroupBuilder:
+    """Biçim, kelime sırası ve tek kelimelik türevleri aynı grupta tutar.
+
+    Amaç benzer satırları silmek değil, olası simülasyon/augmentation türevlerinin
+    farklı split'lere düşmesini engellemektir. Böylece test skoru ezberlenmiş bir
+    metnin küçük bir varyasyonuyla yapay olarak yükselmez.
     """
-    Türkçe metin temizleme fonksiyonu.
-    
-    Adımlar:
-      1. NaN/None kontrolü
-      2. URL'leri kaldır
-      3. @mention'ları kaldır
-      4. #hashtag'lerden # işaretini kaldır (kelimeyi koru)
-      5. RT (retweet) etiketini kaldır
-      6. Emoji ve özel karakterleri kaldır (Türkçe harfler korunur)
-      7. Fazla boşlukları tek boşluğa düşür
-      8. Baş ve son boşlukları temizle
-      9. Küçük harfe çevir
-    """
-    if pd.isna(text) or not isinstance(text, str):
-        return ""
-    
-    return normalize_for_model(text)
-
-
-def kelime_say(text):
-    """Metindeki kelime sayısını döndürür."""
-    if pd.isna(text) or not isinstance(text, str) or text.strip() == "":
-        return 0
-    return len(text.split())
-
-
-# ============================================================================
-# 1. ADIM: VERİ SETLERİNİ YÜKLE
-# ============================================================================
-
-print("=" * 70)
-print("  ADIM 1: VERİ SETLERİNİ YÜKLEME")
-print("=" * 70)
-
-# --- HuggingFace Veri Seti ---
-print("\n📂 HuggingFace - turkish_toxic_language.csv yükleniyor...")
-df_toxic = pd.read_csv(
-    os.path.join(VERI_KLASORU, "turkish_toxic_language.csv"),
-    encoding='utf-8'
-)
-print(f"   ✅ Yüklendi: {df_toxic.shape[0]:,} satır, {df_toxic.shape[1]} sütun")
-print(f"   Sütunlar: {df_toxic.columns.tolist()}")
-
-# --- Kaggle Veri Seti ---
-print("\n📂 Kaggle - train/test/valid.csv yükleniyor...")
-df_train = pd.read_csv(os.path.join(VERI_KLASORU, "train.csv"), encoding='utf-8')
-df_test = pd.read_csv(os.path.join(VERI_KLASORU, "test.csv"), encoding='utf-8')
-df_valid = pd.read_csv(os.path.join(VERI_KLASORU, "valid.csv"), encoding='utf-8')
-
-df_kaggle = pd.concat([df_train, df_test, df_valid], ignore_index=True)
-print(f"   ✅ Train:  {df_train.shape[0]:,} satır")
-print(f"   ✅ Test:   {df_test.shape[0]:,} satır")
-print(f"   ✅ Valid:  {df_valid.shape[0]:,} satır")
-print(f"   ✅ Toplam: {df_kaggle.shape[0]:,} satır")
-print(f"   Sütunlar: {df_kaggle.columns.tolist()}")
-
-
-# ============================================================================
-# 2. ADIM: ÖN İNCELEME (TEMİZLEME ÖNCESİ)
-# ============================================================================
-
-print("\n" + "=" * 70)
-print("  ADIM 2: ÖN İNCELEME (TEMİZLEME ÖNCESİ)")
-print("=" * 70)
-
-# --- HuggingFace ---
-print("\n📊 HuggingFace Veri Seti:")
-print(f"   Null değerler:\n{df_toxic.isnull().sum().to_string()}")
-print(f"   Duplikat satır: {df_toxic.duplicated().sum()}")
-print(f"   is_toxic dağılımı:")
-print(f"     0 (Normal):    {(df_toxic['is_toxic']==0).sum():,} ({(df_toxic['is_toxic']==0).mean()*100:.1f}%)")
-print(f"     1 (Saldırgan): {(df_toxic['is_toxic']==1).sum():,} ({(df_toxic['is_toxic']==1).mean()*100:.1f}%)")
-print(f"   target dağılımı:")
-for t, c in df_toxic['target'].value_counts().items():
-    print(f"     {t:15s}: {c:6,d} ({c/len(df_toxic)*100:.1f}%)")
-
-# --- Kaggle ---
-print("\n📊 Kaggle Veri Seti:")
-print(f"   Null değerler:\n{df_kaggle.isnull().sum().to_string()}")
-print(f"   Duplikat satır: {df_kaggle.duplicated().sum()}")
-print(f"   label dağılımı:")
-print(f"     0 (Normal):    {(df_kaggle['label']==0).sum():,} ({(df_kaggle['label']==0).mean()*100:.1f}%)")
-print(f"     1 (Saldırgan): {(df_kaggle['label']==1).sum():,} ({(df_kaggle['label']==1).mean()*100:.1f}%)")
-
-
-# ============================================================================
-# 3. ADIM: SÜTUN UYUMLULAŞTIRMA
-# ============================================================================
-
-print("\n" + "=" * 70)
-print("  ADIM 3: SÜTUN UYUMLULAŞTIRMA")
-print("=" * 70)
-
-# HuggingFace: text, target, source, is_toxic -> text, label
-df_hf = df_toxic[['text', 'is_toxic']].copy()
-df_hf.columns = ['text', 'label']
-df_hf['kaynak'] = 'huggingface'
-print(f"   ✅ HuggingFace: {len(df_hf):,} satır -> [text, label, kaynak]")
-
-# Kaggle: id, text, label -> text, label
-df_kg = df_kaggle[['text', 'label']].copy()
-df_kg['kaynak'] = 'kaggle'
-print(f"   ✅ Kaggle:      {len(df_kg):,} satır -> [text, label, kaynak]")
-
-
-# ============================================================================
-# 4. ADIM: METİN TEMİZLEME
-# ============================================================================
-
-print("\n" + "=" * 70)
-print("  ADIM 4: METİN TEMİZLEME")
-print("=" * 70)
-
-print("\n🧹 HuggingFace metinleri temizleniyor...")
-df_hf['text_temiz'] = df_hf['text'].apply(metin_temizle)
-print("   ✅ Tamamlandı")
-
-print("\n🧹 Kaggle metinleri temizleniyor...")
-df_kg['text_temiz'] = df_kg['text'].apply(metin_temizle)
-print("   ✅ Tamamlandı")
-
-# Temizleme önce/sonra örnekleri
-print("\n📋 Temizleme örnekleri (Önce → Sonra):")
-for i, (_, row) in enumerate(df_kg[df_kg['text'] != df_kg['text_temiz']].head(5).iterrows()):
-    print(f"\n   Örnek {i+1}:")
-    print(f"   ÖNCE : {row['text'][:120]}")
-    print(f"   SONRA: {row['text_temiz'][:120]}")
-
-
-# ============================================================================
-# 5. ADIM: FİLTRELEME
-# ============================================================================
-
-print("\n" + "=" * 70)
-print("  ADIM 5: FİLTRELEME")
-print("=" * 70)
-
-def filtrele_ve_raporla(df, isim):
-    """Boş, çok kısa ve duplikat satırları filtreler."""
-    baslangic = len(df)
-    
-    # Boş metinleri çıkar
-    df = df[df['text_temiz'].str.strip() != ''].copy()
-    bos_cikarilan = baslangic - len(df)
-    
-    # Çok kısa metinleri çıkar
-    df['kelime_sayisi'] = df['text_temiz'].apply(kelime_say)
-    onceki = len(df)
-    df = df[df['kelime_sayisi'] >= MIN_KELIME_SAYISI].copy()
-    kisa_cikarilan = onceki - len(df)
-    
-    # Çok uzun metinleri kırp
-    uzun_mask = df['text_temiz'].str.len() > MAX_KARAKTER_SAYISI
-    uzun_sayisi = uzun_mask.sum()
-    df.loc[uzun_mask, 'text_temiz'] = df.loc[uzun_mask, 'text_temiz'].str[:MAX_KARAKTER_SAYISI]
-    
-    # Duplikat text'leri çıkar
-    onceki = len(df)
-    df = df.drop_duplicates(subset=['text_temiz']).copy()
-    duplikat_cikarilan = onceki - len(df)
-    
-    print(f"\n   📊 {isim}:")
-    print(f"     Başlangıç:           {baslangic:,}")
-    print(f"     Boş çıkarılan:       {bos_cikarilan:,}")
-    print(f"     Kısa çıkarılan (<{MIN_KELIME_SAYISI}): {kisa_cikarilan:,}")
-    print(f"     Uzun kırpılan (>{MAX_KARAKTER_SAYISI}): {uzun_sayisi:,}")
-    print(f"     Duplikat çıkarılan:  {duplikat_cikarilan:,}")
-    print(f"     Kalan:               {len(df):,}")
-    
-    return df
-
-df_hf = filtrele_ve_raporla(df_hf, "HuggingFace")
-df_kg = filtrele_ve_raporla(df_kg, "Kaggle")
-
-
-# ============================================================================
-# 6. ADIM: VERİ SETLERİNİ BİRLEŞTİR
-# ============================================================================
-
-print("\n" + "=" * 70)
-print("  ADIM 6: VERİ SETLERİNİ BİRLEŞTİRME")
-print("=" * 70)
-
-# Birleştir
-df_birlesik = pd.concat([
-    df_hf[['text_temiz', 'label', 'kaynak']],
-    df_kg[['text_temiz', 'label', 'kaynak']]
-], ignore_index=True)
-
-# Sütun adını düzelt
-df_birlesik.rename(columns={'text_temiz': 'text'}, inplace=True)
-
-# Birleşik duplikatları çıkar
-onceki = len(df_birlesik)
-etiket_sayilari = df_birlesik.groupby('text')['label'].nunique()
-celiskili_metinler = etiket_sayilari[etiket_sayilari > 1].index
-if len(celiskili_metinler):
-    klasor_olustur(CIKTI_KLASORU)
-    celiski_raporu = df_birlesik[df_birlesik['text'].isin(celiskili_metinler)].sort_values('text')
-    celiski_yolu = os.path.join(CIKTI_KLASORU, 'etiket_celiskileri.csv')
-    celiski_raporu.to_csv(celiski_yolu, index=False, encoding='utf-8')
-    raise ValueError(f"{len(celiskili_metinler)} çelişkili metin bulundu. İnceleyin: {celiski_yolu}")
-
-df_birlesik = df_birlesik.drop_duplicates(subset=['text']).copy()
-print(f"   Birleşik duplikat çıkarılan: {onceki - len(df_birlesik):,}")
-
-print(f"\n   ✅ Birleşik veri seti: {len(df_birlesik):,} satır")
-print(f"   Sınıf dağılımı:")
-print(f"     0 (Normal):    {(df_birlesik['label']==0).sum():,} ({(df_birlesik['label']==0).mean()*100:.1f}%)")
-print(f"     1 (Saldırgan): {(df_birlesik['label']==1).sum():,} ({(df_birlesik['label']==1).mean()*100:.1f}%)")
-print(f"   Kaynak dağılımı:")
-for k, c in df_birlesik['kaynak'].value_counts().items():
-    print(f"     {k:15s}: {c:,}")
-
-
-# ============================================================================
-# 7. ADIM: TRAIN / TEST / VALIDATION SPLIT
-# ============================================================================
-
-print("\n" + "=" * 70)
-print("  ADIM 7: TRAIN / TEST / VALIDATION SPLIT")
-print("=" * 70)
-
-# Stratified split (sınıf dengesi korunarak)
-X = df_birlesik[['text', 'kaynak']]
-y = df_birlesik['label']
-strata = y.astype(str) + '_' + df_birlesik['kaynak'].astype(str)
-
-# Önce train+valid ve test ayır
-X_train_valid, X_test, y_train_valid, y_test = train_test_split(
-    X, y,
-    test_size=TEST_ORANI,
-    random_state=RANDOM_SEED,
-    stratify=strata
-)
-
-# Sonra train ve valid ayır
-valid_ratio_adjusted = VALID_ORANI / (1 - TEST_ORANI)
-X_train, X_valid, y_train, y_valid = train_test_split(
-    X_train_valid, y_train_valid,
-    test_size=valid_ratio_adjusted,
-    random_state=RANDOM_SEED,
-    stratify=(y_train_valid.astype(str) + '_' + X_train_valid['kaynak'].astype(str))
-)
-
-print(f"\n   📊 Bölümleme sonuçları:")
-print(f"     Train:      {len(X_train):,} satır ({len(X_train)/len(X)*100:.1f}%)")
-print(f"     Validation: {len(X_valid):,} satır ({len(X_valid)/len(X)*100:.1f}%)")
-print(f"     Test:       {len(X_test):,} satır ({len(X_test)/len(X)*100:.1f}%)")
-
-print(f"\n   Sınıf dağılımı (Train):")
-print(f"     0: {(y_train==0).sum():,} ({(y_train==0).mean()*100:.1f}%)")
-print(f"     1: {(y_train==1).sum():,} ({(y_train==1).mean()*100:.1f}%)")
-
-# DataFrame'leri oluştur
-df_train_final = X_train.copy(); df_train_final['label'] = y_train
-df_valid_final = X_valid.copy(); df_valid_final['label'] = y_valid
-df_test_final  = X_test.copy(); df_test_final['label'] = y_test
-
-
-# ============================================================================
-# 8. ADIM: TEMİZLENMİŞ VERİYİ KAYDET
-# ============================================================================
-
-print("\n" + "=" * 70)
-print("  ADIM 8: TEMİZLENMİŞ VERİYİ KAYDETME")
-print("=" * 70)
-
-klasor_olustur(CIKTI_KLASORU)
-
-df_train_final.to_csv(os.path.join(CIKTI_KLASORU, "train.csv"), index=False, encoding='utf-8')
-df_valid_final.to_csv(os.path.join(CIKTI_KLASORU, "valid.csv"), index=False, encoding='utf-8')
-df_test_final.to_csv(os.path.join(CIKTI_KLASORU, "test.csv"), index=False, encoding='utf-8')
-df_birlesik.to_csv(os.path.join(CIKTI_KLASORU, "birlesik_tum_veri.csv"), index=False, encoding='utf-8')
-
-print(f"   ✅ train.csv  → {len(df_train_final):,} satır")
-print(f"   ✅ valid.csv  → {len(df_valid_final):,} satır")
-print(f"   ✅ test.csv   → {len(df_test_final):,} satır")
-print(f"   ✅ birlesik_tum_veri.csv → {len(df_birlesik):,} satır")
-
-
-# ============================================================================
-# 9. ADIM: KEŞİFSEL VERİ ANALİZİ (EDA)
-# ============================================================================
-
-print("\n" + "=" * 70)
-print("  ADIM 9: KEŞİFSEL VERİ ANALİZİ (EDA)")
-print("=" * 70)
-
-klasor_olustur(GRAFIK_KLASORU)
-
-# --- Grafik 1: Sınıf Dağılımı ---
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-# Pie chart
-sinif_sayilari = df_birlesik['label'].value_counts()
-labels_pie = ['Normal (0)', 'Saldırgan (1)']
-colors_pie = ['#2ecc71', '#e74c3c']
-axes[0].pie(sinif_sayilari.values, labels=labels_pie, autopct='%1.1f%%',
-            colors=colors_pie, startangle=90, textprops={'fontsize': 12})
-axes[0].set_title('Sınıf Dağılımı (Pasta Grafik)', fontsize=14, fontweight='bold')
-
-# Bar chart
-sinif_sayilari.plot(kind='bar', ax=axes[1], color=colors_pie, edgecolor='black')
-axes[1].set_title('Sınıf Dağılımı (Çubuk Grafik)', fontsize=14, fontweight='bold')
-axes[1].set_xlabel('Etiket', fontsize=12)
-axes[1].set_ylabel('Sayı', fontsize=12)
-axes[1].set_xticklabels(['Normal (0)', 'Saldırgan (1)'], rotation=0)
-for i, v in enumerate(sinif_sayilari.values):
-    axes[1].text(i, v + 200, f'{v:,}', ha='center', fontweight='bold', fontsize=11)
-
-plt.tight_layout()
-plt.savefig(os.path.join(GRAFIK_KLASORU, '01_sinif_dagilimi.png'), dpi=150, bbox_inches='tight')
-plt.close()
-print("   ✅ 01_sinif_dagilimi.png kaydedildi")
-
-
-# --- Grafik 2: Metin Uzunluğu Dağılımı ---
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-df_birlesik['metin_uzunlugu'] = df_birlesik['text'].str.len()
-df_birlesik['kelime_sayisi'] = df_birlesik['text'].str.split().str.len()
-
-# Karakter uzunluğu
-for label, color, isim in [(0, '#2ecc71', 'Normal'), (1, '#e74c3c', 'Saldırgan')]:
-    subset = df_birlesik[df_birlesik['label'] == label]['metin_uzunlugu']
-    axes[0].hist(subset, bins=50, alpha=0.6, color=color, label=isim, edgecolor='black')
-axes[0].set_title('Metin Uzunluğu Dağılımı (Karakter)', fontsize=14, fontweight='bold')
-axes[0].set_xlabel('Karakter Sayısı', fontsize=12)
-axes[0].set_ylabel('Frekans', fontsize=12)
-axes[0].legend(fontsize=11)
-axes[0].set_xlim(0, 800)
-
-# Kelime sayısı
-for label, color, isim in [(0, '#2ecc71', 'Normal'), (1, '#e74c3c', 'Saldırgan')]:
-    subset = df_birlesik[df_birlesik['label'] == label]['kelime_sayisi']
-    axes[1].hist(subset, bins=50, alpha=0.6, color=color, label=isim, edgecolor='black')
-axes[1].set_title('Metin Uzunluğu Dağılımı (Kelime)', fontsize=14, fontweight='bold')
-axes[1].set_xlabel('Kelime Sayısı', fontsize=12)
-axes[1].set_ylabel('Frekans', fontsize=12)
-axes[1].legend(fontsize=11)
-axes[1].set_xlim(0, 150)
-
-plt.tight_layout()
-plt.savefig(os.path.join(GRAFIK_KLASORU, '02_metin_uzunlugu.png'), dpi=150, bbox_inches='tight')
-plt.close()
-print("   ✅ 02_metin_uzunlugu.png kaydedildi")
-
-
-# --- Grafik 3: Kaynak Dağılımı ---
-fig, ax = plt.subplots(figsize=(8, 5))
-kaynak_sayilari = df_birlesik['kaynak'].value_counts()
-kaynak_sayilari.plot(kind='bar', ax=ax, color=['#3498db', '#e67e22'], edgecolor='black')
-ax.set_title('Kaynak Bazında Veri Dağılımı', fontsize=14, fontweight='bold')
-ax.set_xlabel('Kaynak', fontsize=12)
-ax.set_ylabel('Sayı', fontsize=12)
-ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
-for i, v in enumerate(kaynak_sayilari.values):
-    ax.text(i, v + 200, f'{v:,}', ha='center', fontweight='bold', fontsize=11)
-plt.tight_layout()
-plt.savefig(os.path.join(GRAFIK_KLASORU, '03_kaynak_dagilimi.png'), dpi=150, bbox_inches='tight')
-plt.close()
-print("   ✅ 03_kaynak_dagilimi.png kaydedildi")
-
-
-# --- Grafik 4: Box Plot - Metin Uzunlukları ---
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-sns.boxplot(x='label', y='metin_uzunlugu', data=df_birlesik, ax=axes[0],
-            palette=['#2ecc71', '#e74c3c'])
-axes[0].set_title('Karakter Uzunluğu (Box Plot)', fontsize=14, fontweight='bold')
-axes[0].set_xlabel('Etiket (0=Normal, 1=Saldırgan)', fontsize=12)
-axes[0].set_ylabel('Karakter Sayısı', fontsize=12)
-axes[0].set_ylim(0, 800)
-
-sns.boxplot(x='label', y='kelime_sayisi', data=df_birlesik, ax=axes[1],
-            palette=['#2ecc71', '#e74c3c'])
-axes[1].set_title('Kelime Sayısı (Box Plot)', fontsize=14, fontweight='bold')
-axes[1].set_xlabel('Etiket (0=Normal, 1=Saldırgan)', fontsize=12)
-axes[1].set_ylabel('Kelime Sayısı', fontsize=12)
-axes[1].set_ylim(0, 150)
-
-plt.tight_layout()
-plt.savefig(os.path.join(GRAFIK_KLASORU, '04_boxplot_uzunluk.png'), dpi=150, bbox_inches='tight')
-plt.close()
-print("   ✅ 04_boxplot_uzunluk.png kaydedildi")
-
-
-# --- Grafik 5: Word Cloud ---
-try:
-    from wordcloud import WordCloud
-    
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    
-    # Normal metinler
-    normal_text = ' '.join(df_birlesik[df_birlesik['label'] == 0]['text'].tolist())
-    wc_normal = WordCloud(
-        width=800, height=400,
-        background_color='white',
-        colormap='Greens',
-        max_words=100,
-        collocations=False
-    ).generate(normal_text)
-    axes[0].imshow(wc_normal, interpolation='bilinear')
-    axes[0].set_title('Normal Metinler - Word Cloud', fontsize=14, fontweight='bold')
-    axes[0].axis('off')
-    
-    # Saldırgan metinler
-    saldirgan_text = ' '.join(df_birlesik[df_birlesik['label'] == 1]['text'].tolist())
-    wc_saldirgan = WordCloud(
-        width=800, height=400,
-        background_color='white',
-        colormap='Reds',
-        max_words=100,
-        collocations=False
-    ).generate(saldirgan_text)
-    axes[1].imshow(wc_saldirgan, interpolation='bilinear')
-    axes[1].set_title('Saldırgan Metinler - Word Cloud', fontsize=14, fontweight='bold')
-    axes[1].axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(GRAFIK_KLASORU, '05_wordcloud.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    print("   ✅ 05_wordcloud.png kaydedildi")
-    
-except ImportError:
-    print("   ⚠️ wordcloud kütüphanesi yüklü değil. Word cloud oluşturulamadı.")
-    print("      Yüklemek için: pip install wordcloud")
-
-
-# --- Grafik 6: En Sık Kullanılan Kelimeler ---
-fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-for idx, (label, title, color) in enumerate([(0, 'Normal', '#2ecc71'), (1, 'Saldırgan', '#e74c3c')]):
-    all_words = ' '.join(df_birlesik[df_birlesik['label'] == label]['text'].tolist()).split()
-    
-    # Türkçe stop words (temel)
-    stop_words = {'bir', 'bu', 'de', 'da', 've', 'ile', 'için', 'mi', 'mı', 'mu', 'mü',
-                  'ne', 'ben', 'sen', 'biz', 'siz', 'o', 'var', 'yok', 'ki', 'ama',
-                  'daha', 'en', 'gibi', 'kadar', 'sonra', 'olan', 'olarak', 'ya',
-                  'hem', 'her', 'hiç', 'çok', 'bile', 'şey', 'ise', 'olan'}
-    
-    filtered_words = [w for w in all_words if w not in stop_words and len(w) > 2]
-    word_counts = Counter(filtered_words).most_common(20)
-    
-    words, counts = zip(*word_counts)
-    axes[idx].barh(range(len(words)), counts, color=color, edgecolor='black')
-    axes[idx].set_yticks(range(len(words)))
-    axes[idx].set_yticklabels(words, fontsize=10)
-    axes[idx].invert_yaxis()
-    axes[idx].set_title(f'En Sık Kelimeler - {title}', fontsize=14, fontweight='bold')
-    axes[idx].set_xlabel('Frekans', fontsize=12)
-
-plt.tight_layout()
-plt.savefig(os.path.join(GRAFIK_KLASORU, '06_en_sik_kelimeler.png'), dpi=150, bbox_inches='tight')
-plt.close()
-print("   ✅ 06_en_sik_kelimeler.png kaydedildi")
-
-
-# --- Grafik 7: Train/Test/Valid Dağılımı ---
-fig, ax = plt.subplots(figsize=(8, 5))
-split_sayilari = [len(df_train_final), len(df_valid_final), len(df_test_final)]
-split_labels = [f'Train\n({len(df_train_final):,})', 
-                f'Validation\n({len(df_valid_final):,})', 
-                f'Test\n({len(df_test_final):,})']
-colors_split = ['#3498db', '#f39c12', '#e74c3c']
-ax.pie(split_sayilari, labels=split_labels, autopct='%1.1f%%',
-       colors=colors_split, startangle=90, textprops={'fontsize': 12})
-ax.set_title('Train / Validation / Test Dağılımı', fontsize=14, fontweight='bold')
-plt.tight_layout()
-plt.savefig(os.path.join(GRAFIK_KLASORU, '07_split_dagilimi.png'), dpi=150, bbox_inches='tight')
-plt.close()
-print("   ✅ 07_split_dagilimi.png kaydedildi")
-
-
-# ============================================================================
-# 10. ADIM: ÖZET
-# ============================================================================
-
-print("\n" + "=" * 70)
-print("  ÖZET")
-print("=" * 70)
-
-print(f"""
-   📁 Temizlenmiş veriler: {CIKTI_KLASORU}
-      ├── train.csv          ({len(df_train_final):,} satır)
-      ├── valid.csv          ({len(df_valid_final):,} satır)
-      ├── test.csv           ({len(df_test_final):,} satır)
-      └── birlesik_tum_veri.csv ({len(df_birlesik):,} satır)
-
-   📊 Grafikler: {GRAFIK_KLASORU}
-      ├── 01_sinif_dagilimi.png
-      ├── 02_metin_uzunlugu.png
-      ├── 03_kaynak_dagilimi.png
-      ├── 04_boxplot_uzunluk.png
-      ├── 05_wordcloud.png
-      ├── 06_en_sik_kelimeler.png
-      └── 07_split_dagilimi.png
-
-   ✅ Veri temizleme tamamlandı! 
-   ➡️  Sonraki adım: python 02_model_egitimi.py
-""")
+
+    def __init__(self, similarity_threshold: float = 0.90) -> None:
+        self.similarity_threshold = similarity_threshold
+
+    @staticmethod
+    def _compact(text: str) -> str:
+        return re.sub(r"[^\wçğıöşü]+", "", text, flags=re.IGNORECASE)
+
+    @staticmethod
+    def _tokens(text: str) -> tuple[str, ...]:
+        return tuple(re.findall(r"[\wçğıöşü]+", text.lower(), flags=re.IGNORECASE))
+
+    def _similar(self, left: str, right: str) -> bool:
+        if left == right:
+            return True
+        left_tokens, right_tokens = set(self._tokens(left)), set(self._tokens(right))
+        union = left_tokens | right_tokens
+        jaccard = len(left_tokens & right_tokens) / max(len(union), 1)
+        if jaccard >= self.similarity_threshold:
+            return True
+        return SequenceMatcher(None, left, right, autojunk=False).ratio() >= self.similarity_threshold
+
+    @staticmethod
+    def _remember_or_union(
+        key: str,
+        index: int,
+        table: dict[str, int],
+        union_find: UnionFind,
+        texts: Sequence[str],
+        comparator=None,
+    ) -> None:
+        previous = table.get(key)
+        if previous is None:
+            table[key] = index
+        elif comparator is None or comparator(texts[previous], texts[index]):
+            union_find.union(previous, index)
+
+    def build(
+        self, texts: Sequence[str], entity_groups: Sequence[str] | None = None
+    ) -> tuple[list[str], dict[str, int]]:
+        union_find = UnionFind(len(texts))
+        compact_table: dict[str, int] = {}
+        bag_table: dict[str, int] = {}
+        deletion_table: dict[str, int] = {}
+        token_sequence_table: dict[str, int] = {}
+        entity_table: dict[str, int] = {}
+
+        for index, text in enumerate(texts):
+            compact = self._compact(text)
+            if len(compact) >= 4:
+                self._remember_or_union(compact, index, compact_table, union_find, texts)
+
+            tokens = self._tokens(text)
+            if 4 <= len(tokens) <= 14:
+                full_token_key = " ".join(tokens)
+                self._remember_or_union(
+                    full_token_key,
+                    index,
+                    deletion_table,
+                    union_find,
+                    texts,
+                    self._similar,
+                )
+                self._remember_or_union(
+                    full_token_key,
+                    index,
+                    token_sequence_table,
+                    union_find,
+                    texts,
+                    self._similar,
+                )
+            if 4 <= len(tokens) <= 40:
+                bag_key = " ".join(sorted(tokens))
+                self._remember_or_union(
+                    bag_key, index, bag_table, union_find, texts, self._similar
+                )
+
+            # Özellikle sentetik random-word-deletion varyasyonlarını yakalar.
+            if 5 <= len(tokens) <= 14:
+                for removed_index in range(len(tokens)):
+                    deletion_key = " ".join(tokens[:removed_index] + tokens[removed_index + 1 :])
+                    self._remember_or_union(
+                        deletion_key,
+                        index,
+                        token_sequence_table,
+                        union_find,
+                        texts,
+                        self._similar,
+                    )
+                    self._remember_or_union(
+                        deletion_key,
+                        index,
+                        deletion_table,
+                        union_find,
+                        texts,
+                        self._similar,
+                    )
+
+        content_roots = [union_find.find(index) for index in range(len(texts))]
+        near_duplicate_rows = len(content_roots) - len(set(content_roots))
+        entity_grouped_rows = 0
+        if entity_groups is not None:
+            entity_counts: dict[str, int] = {}
+            for index, entity_group in enumerate(entity_groups):
+                if entity_group:
+                    entity_counts[entity_group] = entity_counts.get(entity_group, 0) + 1
+                    self._remember_or_union(
+                        entity_group, index, entity_table, union_find, texts
+                    )
+            entity_grouped_rows = sum(count - 1 for count in entity_counts.values() if count > 1)
+
+        roots = [union_find.find(index) for index in range(len(texts))]
+        root_to_id: dict[int, str] = {}
+        for root in sorted(set(roots)):
+            # Harf icermeyen hash'lerin CSV okunurken sayiya donusup bastaki
+            # sifirlarini kaybetmesini engellemek icin acik bir metin oneki.
+            root_to_id[root] = "g_" + hashlib.blake2b(
+                texts[root].encode("utf-8"), digest_size=8
+            ).hexdigest()
+        group_ids = [root_to_id[root] for root in roots]
+        stats = {
+            "groups": len(set(group_ids)),
+            "near_duplicate_rows": int(near_duplicate_rows),
+            "entity_groups": len(entity_table),
+            "entity_grouped_rows": int(entity_grouped_rows),
+        }
+        return group_ids, stats
+
+
+class TurkishToxicDataCleaner:
+    """Tüm veri keşfi, temizliği, gruplaması ve split üretimini yürütür."""
+
+    def __init__(self, config: DataCleaningConfig) -> None:
+        self.config = config
+        self.file_reports: list[dict[str, object]] = []
+        self.rejected_frames: list[pd.DataFrame] = []
+        self.conflicts = pd.DataFrame()
+        self.duplicates = pd.DataFrame()
+
+    def _default_input_dirs(self) -> tuple[Path, ...]:
+        candidates = [
+            self.config.project_dir / "ham_veri",
+            self.config.project_dir / "raw_data",
+            self.config.project_dir,
+            self.config.project_dir.parent / "veri setleri ve url",
+            self.config.project_dir.parent,
+        ]
+        env_dir = os.getenv("RAW_DATA_DIR")
+        if env_dir:
+            candidates.insert(0, Path(env_dir))
+        resolved: list[Path] = []
+        for path in candidates:
+            path = path.resolve()
+            if path.exists() and path not in resolved:
+                resolved.append(path)
+        return tuple(resolved)
+
+    def discover_files(self) -> list[Path]:
+        using_default_dirs = not self.config.input_dirs
+        input_dirs = self.config.input_dirs or self._default_input_dirs()
+        if not input_dirs:
+            raise FileNotFoundError(
+                "Ham veri klasörü bulunamadı. --input-dir verin veya ham_veri/ oluşturun."
+            )
+
+        output_dir = self.config.output_dir.resolve()
+        files: set[Path] = set()
+        shallow_default_dirs = {
+            self.config.project_dir.resolve(),
+            self.config.project_dir.parent.resolve(),
+        }
+        for input_dir in input_dirs:
+            if not input_dir.exists():
+                raise FileNotFoundError(f"Veri klasörü bulunamadı: {input_dir}")
+            # Proje ve calisma alani koklerinde yalnizca dogrudan yuklenen
+            # CSV'leri tara. ham_veri/raw_data gibi veri klasorleri ise
+            # alt klasorleriyle birlikte kesfedilir. Boylece uretilmis split'ler
+            # tekrar ham veri olarak okunmaz.
+            iterator = (
+                input_dir.glob("*.csv")
+                if using_default_dirs and input_dir in shallow_default_dirs
+                else input_dir.rglob("*.csv")
+            )
+            for path in iterator:
+                resolved = path.resolve()
+                if output_dir == resolved.parent or output_dir in resolved.parents:
+                    continue
+                if any(part.lower() in SKIPPED_DIRECTORIES for part in resolved.parts):
+                    continue
+                files.add(resolved)
+        if not files:
+            raise FileNotFoundError(f"CSV bulunamadı: {', '.join(map(str, input_dirs))}")
+        return sorted(files, key=lambda path: str(path).casefold())
+
+    @staticmethod
+    def _read_csv(path: Path) -> tuple[pd.DataFrame, str]:
+        errors: list[str] = []
+        for encoding in ("utf-8-sig", "utf-8", "cp1254", "latin-1"):
+            try:
+                frame = pd.read_csv(
+                    path,
+                    encoding=encoding,
+                    sep=None,
+                    engine="python",
+                    dtype=object,
+                    on_bad_lines="warn",
+                )
+                if frame.shape[1] == 1:
+                    raise ValueError("ayraç algılanamadı")
+                return frame, encoding
+            except (UnicodeDecodeError, pd.errors.ParserError, ValueError) as exc:
+                errors.append(f"{encoding}: {exc}")
+        raise ValueError(f"{path} okunamadı ({'; '.join(errors)})")
+
+    @staticmethod
+    def _find_column(columns: Iterable[object], aliases: Sequence[str]) -> object | None:
+        normalized = {_ascii_identifier(column): column for column in columns}
+        for alias in aliases:
+            if alias in normalized:
+                return normalized[alias]
+        return None
+
+    @staticmethod
+    def _parse_label(value: object) -> int | None:
+        if pd.isna(value):
+            return None
+        if isinstance(value, (bool, np.bool_)):
+            return int(value)
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            numeric = float(value)
+            return int(numeric) if numeric in (0.0, 1.0) else None
+        normalized = re.sub(r"[_-]+", " ", str(value).strip().lower())
+        try:
+            numeric = float(normalized.replace(",", "."))
+            return int(numeric) if numeric in (0.0, 1.0) else None
+        except ValueError:
+            pass
+        if normalized in POSITIVE_LABELS:
+            return 1
+        if normalized in NEGATIVE_LABELS:
+            return 0
+        return None
+
+    @staticmethod
+    def _source_name(path: Path) -> str:
+        stem = _ascii_identifier(path.stem)
+        split_number = re.fullmatch(r"(?:train|valid|validation|test)_(\d+)", stem)
+        if split_number:
+            return f"uploaded_{split_number.group(1)}"
+        if "turkish_toxic" in stem:
+            return "huggingface"
+        if stem in {"train", "valid", "validation", "test"}:
+            parent = _ascii_identifier(path.parent.name)
+            return "kaggle" if parent in {"ham_veri", "veri_setleri_ve_url"} else parent
+        return stem or "bilinmeyen"
+
+    def load_and_standardize(self, path: Path) -> pd.DataFrame:
+        raw, encoding = self._read_csv(path)
+        text_column = self._find_column(raw.columns, TEXT_ALIASES)
+        label_column = self._find_column(raw.columns, LABEL_ALIASES)
+        group_column = self._find_column(raw.columns, GROUP_ALIASES)
+        agreement_column = self._find_column(raw.columns, AGREEMENT_ALIASES)
+        notes_column = self._find_column(raw.columns, NOTES_ALIASES)
+        if text_column is None or label_column is None:
+            raise ValueError(
+                f"{path}: metin/etiket sütunu bulunamadı. Sütunlar={list(raw.columns)}"
+            )
+
+        source = self._source_name(path)
+        standardized = pd.DataFrame(
+            {
+                "raw_text": raw[text_column],
+                "raw_label": raw[label_column],
+                "kaynak": source,
+                "dosya": path.name,
+                "satir_no": np.arange(2, len(raw) + 2),
+            }
+        )
+        group_column_id = _ascii_identifier(group_column) if group_column is not None else ""
+        if group_column is None:
+            standardized["entity_group"] = ""
+        else:
+            def stable_group_value(value: object) -> str:
+                if pd.isna(value) or str(value).strip() == "":
+                    return ""
+                raw_value = str(value).strip()
+                if group_column_id in TEXTUAL_GROUP_ALIASES:
+                    normalized_value = normalize_for_document(raw_value)
+                else:
+                    normalized_value = raw_value.casefold()
+                return source + ":" + hashlib.blake2b(
+                    normalized_value.encode("utf-8"), digest_size=8
+                ).hexdigest()
+
+            standardized["entity_group"] = raw[group_column].map(
+                stable_group_value
+            )
+        standardized["label"] = standardized["raw_label"].map(self._parse_label)
+        standardized["text"] = standardized["raw_text"].map(normalize_for_document)
+        standardized["kelime_sayisi"] = standardized["text"].str.split().str.len()
+
+        reasons = np.full(len(standardized), "", dtype=object)
+        reasons[standardized["raw_text"].isna().to_numpy()] = "null_text"
+        reasons[(standardized["text"] == "").to_numpy()] = "empty_after_normalization"
+        reasons[standardized["label"].isna().to_numpy()] = "invalid_label"
+        disagreement_mask = np.zeros(len(standardized), dtype=bool)
+        if agreement_column is not None:
+            agreement = raw[agreement_column].map(
+                lambda value: re.sub(r"[_-]+", " ", str(value).strip().lower())
+                if not pd.isna(value)
+                else ""
+            )
+            disagreement_mask = agreement.isin(
+                {"0", "false", "no", "hayir", "hayır", "disagree", "uyusmuyor"}
+            ).to_numpy()
+            reasons[(reasons == "") & disagreement_mask] = "annotator_disagreement"
+        too_short = standardized["kelime_sayisi"].fillna(0).lt(self.config.min_words).to_numpy()
+        reasons[(reasons == "") & too_short] = "too_short"
+        valid_mask = reasons == ""
+
+        rejected = standardized.loc[~valid_mask].copy()
+        if not rejected.empty:
+            rejected["red_nedeni"] = reasons[~valid_mask]
+            self.rejected_frames.append(rejected)
+
+        clean = standardized.loc[valid_mask].copy()
+        long_mask = clean["text"].str.len().gt(self.config.max_characters)
+        clean.loc[long_mask, "text"] = clean.loc[long_mask, "text"].str.slice(
+            stop=self.config.max_characters
+        ).str.rsplit(" ", n=1).str[0]
+        clean["label"] = clean["label"].astype("int8")
+
+        self.file_reports.append(
+            {
+                "path": str(path),
+                "source": source,
+                "encoding": encoding,
+                "text_column": str(text_column),
+                "label_column": str(label_column),
+                "group_column": str(group_column) if group_column is not None else None,
+                "agreement_column": (
+                    str(agreement_column) if agreement_column is not None else None
+                ),
+                "raw_rows": int(len(raw)),
+                "accepted_rows": int(len(clean)),
+                "rejected_rows": int(len(rejected)),
+                "annotator_disagreement_rows": int(disagreement_mask.sum()),
+                "placeholder_annotation_rows": int(
+                    raw[notes_column]
+                    .fillna("")
+                    .astype(str)
+                    .str.contains("placeholder", case=False, regex=False)
+                    .sum()
+                    if notes_column is not None
+                    else 0
+                ),
+                "raw_label_distribution": {
+                    str(key): int(value)
+                    for key, value in raw[label_column]
+                    .fillna("<NULL>")
+                    .astype(str)
+                    .value_counts()
+                    .items()
+                },
+                "binary_label_distribution": {
+                    str(key): int(value)
+                    for key, value in clean["label"].value_counts().sort_index().items()
+                },
+                "truncated_rows": int(long_mask.sum()),
+                "sha256": _sha256_file(path),
+            }
+        )
+        return clean[["text", "label", "kaynak", "dosya", "satir_no", "entity_group"]]
+
+    def resolve_duplicates_and_conflicts(self, frame: pd.DataFrame) -> pd.DataFrame:
+        frame = frame.sort_values(["text", "label", "kaynak", "dosya", "satir_no"]).reset_index(drop=True)
+        conflict_texts = frame.groupby("text", sort=False)["label"].nunique()
+        conflict_texts = set(conflict_texts[conflict_texts > 1].index)
+        self.conflicts = frame[frame["text"].isin(conflict_texts)].copy()
+
+        if conflict_texts and self.config.conflict_policy == "error":
+            self._write_quality_tables()
+            raise ValueError(
+                f"{len(conflict_texts)} çelişkili metin bulundu: "
+                f"{self.config.report_dir / 'etiket_celiskileri.csv'}"
+            )
+        if conflict_texts and self.config.conflict_policy == "quarantine":
+            frame = frame[~frame["text"].isin(conflict_texts)].copy()
+        elif conflict_texts and self.config.conflict_policy == "majority":
+            counts = frame.groupby(["text", "label"]).size().unstack(fill_value=0)
+            unambiguous = counts[counts.max(axis=1) > counts.sum(axis=1) / 2].idxmax(axis=1)
+            selected = frame[frame["text"].isin(unambiguous.index)].copy()
+            selected = selected[selected.apply(lambda row: row["label"] == unambiguous[row["text"]], axis=1)]
+            frame = pd.concat(
+                [frame[~frame["text"].isin(conflict_texts)], selected], ignore_index=True
+            )
+
+        duplicate_mask = frame.duplicated("text", keep=False)
+        self.duplicates = frame[duplicate_mask].copy()
+        return frame.drop_duplicates("text", keep="first").reset_index(drop=True)
+
+    def add_content_groups(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+        frame = frame.sort_values(["text", "label", "kaynak"]).reset_index(drop=True)
+        if self.config.group_near_duplicates:
+            group_ids, stats = ContentGroupBuilder(
+                self.config.near_duplicate_ratio
+            ).build(frame["text"].tolist(), frame["entity_group"].tolist())
+        else:
+            group_ids = [
+                "g_" + hashlib.blake2b(text.encode("utf-8"), digest_size=8).hexdigest()
+                for text in frame["text"]
+            ]
+            stats = {
+                "groups": len(group_ids),
+                "near_duplicate_rows": 0,
+                "entity_groups": 0,
+                "entity_grouped_rows": 0,
+            }
+        frame["group_id"] = group_ids
+        return frame, stats
+
+    def _fold_count(self) -> int:
+        denominators = [
+            Fraction(self.config.test_ratio).limit_denominator(100).denominator,
+            Fraction(self.config.valid_ratio).limit_denominator(100).denominator,
+        ]
+        return min(math.lcm(*denominators), 50)
+
+    def split(self, frame: pd.DataFrame) -> dict[str, pd.DataFrame]:
+        fold_count = self._fold_count()
+        group_count = frame["group_id"].nunique()
+        if group_count < fold_count:
+            raise ValueError(f"Split için en az {fold_count} içerik grubu gerekli; bulunan={group_count}")
+
+        source_strata = frame["label"].astype(str) + "|" + frame["kaynak"].astype(str)
+        rare = source_strata.map(source_strata.value_counts()).lt(fold_count)
+        strata = source_strata.mask(rare, frame["label"].astype(str) + "|diger_kaynak")
+        if strata.map(strata.value_counts()).min() < fold_count:
+            strata = frame["label"].astype(str)
+
+        splitter = StratifiedGroupKFold(
+            n_splits=fold_count,
+            shuffle=True,
+            random_state=self.config.random_seed,
+        )
+        fold_ids = np.empty(len(frame), dtype=np.int16)
+        for fold_id, (_, validation_indices) in enumerate(
+            splitter.split(frame["text"], strata, groups=frame["group_id"])
+        ):
+            fold_ids[validation_indices] = fold_id
+
+        test_fold_count = max(1, round(self.config.test_ratio * fold_count))
+        valid_fold_count = max(1, round(self.config.valid_ratio * fold_count))
+        test_folds = set(range(test_fold_count))
+        valid_folds = set(range(test_fold_count, test_fold_count + valid_fold_count))
+        masks = {
+            "test": np.isin(fold_ids, list(test_folds)),
+            "valid": np.isin(fold_ids, list(valid_folds)),
+        }
+        masks["train"] = ~(masks["test"] | masks["valid"])
+        splits = {
+            name: frame.loc[mask, ["text", "label", "kaynak", "group_id"]]
+            .sample(frac=1, random_state=self.config.random_seed)
+            .reset_index(drop=True)
+            for name, mask in masks.items()
+        }
+        self._assert_no_leakage(splits)
+        return splits
+
+    @staticmethod
+    def _assert_no_leakage(splits: dict[str, pd.DataFrame]) -> None:
+        for left, right in (("train", "valid"), ("train", "test"), ("valid", "test")):
+            text_overlap = set(splits[left]["text"]) & set(splits[right]["text"])
+            group_overlap = set(splits[left]["group_id"]) & set(splits[right]["group_id"])
+            if text_overlap or group_overlap:
+                raise RuntimeError(
+                    f"Veri sızıntısı: {left}-{right}; text={len(text_overlap)}, group={len(group_overlap)}"
+                )
+
+    def _write_quality_tables(self) -> None:
+        self.config.report_dir.mkdir(parents=True, exist_ok=True)
+        if not self.conflicts.empty:
+            self.conflicts.to_csv(
+                self.config.report_dir / "etiket_celiskileri.csv", index=False, encoding="utf-8"
+            )
+        if not self.duplicates.empty:
+            self.duplicates.to_csv(
+                self.config.report_dir / "yinelenen_metinler.csv", index=False, encoding="utf-8"
+            )
+        if self.rejected_frames:
+            pd.concat(self.rejected_frames, ignore_index=True).to_csv(
+                self.config.report_dir / "reddedilen_satirlar.csv", index=False, encoding="utf-8"
+            )
+
+    def _generate_plots(self, combined: pd.DataFrame, splits: dict[str, pd.DataFrame]) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        plot_dir = self.config.project_dir / "grafikler"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        sns.set_theme(style="whitegrid", context="notebook")
+        plt.rcParams["font.family"] = "DejaVu Sans"
+
+        def save(figure: object, filename: str) -> None:
+            figure.tight_layout()
+            figure.savefig(plot_dir / filename, dpi=170, bbox_inches="tight")
+            plt.close(figure)
+
+        plot_frame = combined[["text", "label", "kaynak", "group_id"]].copy()
+        plot_frame["sinif"] = plot_frame["label"].map({0: "Temiz", 1: "Saldırgan"})
+        plot_frame["karakter_sayisi"] = plot_frame["text"].str.len()
+        plot_frame["kelime_sayisi"] = plot_frame["text"].str.split().str.len()
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        sns.countplot(data=plot_frame, x="sinif", ax=axes[0], hue="sinif", legend=False)
+        axes[0].set_title("Sınıf dağılımı")
+        for container in axes[0].containers:
+            axes[0].bar_label(container, fmt="%.0f")
+        source_counts = plot_frame["kaynak"].value_counts().head(15)
+        sns.barplot(x=source_counts.values, y=source_counts.index, ax=axes[1], color="#4c72b0")
+        axes[1].set_title("Kaynak dağılımı")
+        save(fig, "01_sinif_ve_kaynak_dagilimi.png")
+
+        split_frame = pd.concat(
+            [part.assign(split=name) for name, part in splits.items()], ignore_index=True
+        )
+        fig, ax = plt.subplots(figsize=(9, 5))
+        sns.countplot(data=split_frame, x="split", hue="label", ax=ax)
+        ax.set_title("Split ve sınıf dağılımı")
+        ax.legend(title="Etiket", labels=["Temiz", "Saldırgan"])
+        for container in ax.containers:
+            ax.bar_label(container, fmt="%.0f")
+        save(fig, "02_split_dagilimi.png")
+
+        character_limit = max(float(plot_frame["karakter_sayisi"].quantile(0.99)), 1)
+        fig, ax = plt.subplots(figsize=(11, 5))
+        sns.histplot(
+            data=plot_frame[plot_frame["karakter_sayisi"] <= character_limit],
+            x="karakter_sayisi",
+            hue="sinif",
+            bins=60,
+            stat="density",
+            common_norm=False,
+            element="step",
+            ax=ax,
+        )
+        ax.set_title("Metin karakter uzunluğu dağılımı (%99 aralık)")
+        save(fig, "03_metin_karakter_uzunlugu.png")
+
+        word_limit = max(float(plot_frame["kelime_sayisi"].quantile(0.99)), 1)
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        sns.histplot(
+            data=plot_frame[plot_frame["kelime_sayisi"] <= word_limit],
+            x="kelime_sayisi",
+            hue="sinif",
+            bins=50,
+            stat="density",
+            common_norm=False,
+            element="step",
+            ax=axes[0],
+        )
+        axes[0].set_title("Kelime sayısı dağılımı (%99 aralık)")
+        sns.boxplot(
+            data=plot_frame[plot_frame["kelime_sayisi"] <= word_limit],
+            x="sinif",
+            y="kelime_sayisi",
+            hue="sinif",
+            legend=False,
+            ax=axes[1],
+        )
+        axes[1].set_title("Sınıfa göre kelime sayısı")
+        save(fig, "04_kelime_uzunlugu_histogram_boxplot.png")
+
+        overall_words = Counter(
+            token for text in plot_frame["text"] for token in str(text).split()
+        ).most_common(30)
+        fig, ax = plt.subplots(figsize=(10, 8))
+        if overall_words:
+            words, counts = zip(*reversed(overall_words))
+            ax.barh(words, counts, color="#55a868")
+        ax.set_title("En sık 30 kelime")
+        ax.set_xlabel("Frekans")
+        save(fig, "05_en_sik_kelimeler.png")
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        for label, axis, color in ((0, axes[0], "#4c72b0"), (1, axes[1], "#c44e52")):
+            counts = Counter(
+                token
+                for text in plot_frame.loc[plot_frame["label"] == label, "text"]
+                for token in str(text).split()
+            ).most_common(25)
+            if counts:
+                words, values = zip(*reversed(counts))
+                axis.barh(words, values, color=color)
+            axis.set_title(f"{('Temiz' if label == 0 else 'Saldırgan')} sınıfında sık kelimeler")
+        save(fig, "06_sinif_bazli_en_sik_kelimeler.png")
+
+        try:
+            from wordcloud import WordCloud
+
+            fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+            for label, axis, color_map in ((0, axes[0], "Blues"), (1, axes[1], "Reds")):
+                texts = plot_frame.loc[plot_frame["label"] == label, "text"]
+                if len(texts) > 50_000:
+                    texts = texts.sample(50_000, random_state=self.config.random_seed)
+                cloud = WordCloud(
+                    width=1200,
+                    height=700,
+                    background_color="white",
+                    colormap=color_map,
+                    max_words=250,
+                    collocations=False,
+                    random_state=self.config.random_seed,
+                ).generate(" ".join(texts.astype(str)))
+                axis.imshow(cloud, interpolation="bilinear")
+                axis.axis("off")
+                axis.set_title("Temiz WordCloud" if label == 0 else "Saldırgan WordCloud")
+            save(fig, "07_sinif_bazli_wordcloud.png")
+        except (ImportError, ValueError) as exc:
+            print(f"WordCloud üretilemedi: {exc}")
+
+        source_label = pd.crosstab(
+            plot_frame["kaynak"], plot_frame["sinif"], normalize="index"
+        )
+        fig, ax = plt.subplots(figsize=(10, max(4, 0.65 * len(source_label))))
+        sns.heatmap(source_label, annot=True, fmt=".1%", cmap="YlGnBu", ax=ax)
+        ax.set_title("Kaynak bazında sınıf oranları")
+        save(fig, "08_kaynak_sinif_oranlari.png")
+
+        source_absolute = pd.crosstab(plot_frame["kaynak"], plot_frame["sinif"])
+        fig, ax = plt.subplots(figsize=(11, max(4, 0.65 * len(source_absolute))))
+        source_absolute.plot(kind="barh", stacked=True, ax=ax, color=["#4c72b0", "#c44e52"])
+        ax.set_title("Kaynak bazında mutlak sınıf sayıları")
+        ax.set_xlabel("Satır")
+        save(fig, "09_kaynak_sinif_sayilari.png")
+
+        group_sizes = plot_frame.groupby("group_id").size()
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        sns.histplot(group_sizes.clip(upper=group_sizes.quantile(0.99)), bins=40, ax=axes[0])
+        axes[0].set_title("Yakın-kopya grup boyutu (%99 aralık)")
+        axes[0].set_xlabel("Gruptaki metin sayısı")
+        group_summary = pd.Series(
+            {
+                "Tekil grup": int((group_sizes == 1).sum()),
+                "Çoklu grup": int((group_sizes > 1).sum()),
+            }
+        )
+        axes[1].pie(group_summary.values, labels=group_summary.index, autopct="%1.1f%%")
+        axes[1].set_title("İçerik grupları")
+        save(fig, "10_yakin_kopya_gruplari.png")
+
+        file_quality = pd.DataFrame(self.file_reports)
+        if not file_quality.empty:
+            file_quality["dosya"] = file_quality["path"].map(lambda value: Path(value).name)
+            fig, ax = plt.subplots(figsize=(12, max(5, 0.7 * len(file_quality))))
+            file_quality.set_index("dosya")[["accepted_rows", "rejected_rows"]].plot(
+                kind="barh",
+                stacked=True,
+                color=["#55a868", "#c44e52"],
+                ax=ax,
+            )
+            ax.set_title("Dosya bazında kabul/reddedilme")
+            ax.set_xlabel("Satır")
+            save(fig, "11_dosya_kalite_ozeti.png")
+
+        rejected_count = sum(len(frame) for frame in self.rejected_frames)
+        quality_counts = pd.Series(
+            {
+                "Eğitime kabul": len(combined),
+                "Yinelenen kayıt": len(self.duplicates),
+                "Çelişkili metin": self.conflicts["text"].nunique()
+                if not self.conflicts.empty
+                else 0,
+                "Geçersiz/reddedilen": rejected_count,
+            }
+        )
+        fig, ax = plt.subplots(figsize=(10, 5))
+        bars = ax.bar(quality_counts.index, quality_counts.values, color=sns.color_palette("Set2", 4))
+        ax.bar_label(bars, fmt="%.0f")
+        ax.set_title("Veri temizleme kalite özeti")
+        ax.tick_params(axis="x", rotation=15)
+        save(fig, "12_temizleme_kalite_ozeti.png")
+
+        print(f"{len(list(plot_dir.glob('*.png')))} veri grafiği üretildi: {plot_dir}")
+
+    def _build_audit(
+        self,
+        combined: pd.DataFrame,
+        splits: dict[str, pd.DataFrame],
+        group_stats: dict[str, int],
+    ) -> dict[str, object]:
+        report: dict[str, object] = {
+            "preprocessing_version": PREPROCESSING_VERSION,
+            "seed": self.config.random_seed,
+            "input_files": self.file_reports,
+            "accepted_unique_rows": int(len(combined)),
+            "exact_duplicate_rows": int(len(self.duplicates)),
+            "conflicting_texts": int(self.conflicts["text"].nunique()) if not self.conflicts.empty else 0,
+            **group_stats,
+            "splits": {},
+            "overlap": {},
+        }
+        for name, part in splits.items():
+            report["splits"][name] = {
+                "rows": int(len(part)),
+                "groups": int(part["group_id"].nunique()),
+                "labels": {str(key): int(value) for key, value in part["label"].value_counts().items()},
+                "sources": {str(key): int(value) for key, value in part["kaynak"].value_counts().items()},
+                "sha256": _frame_fingerprint(part),
+            }
+        for left, right in (("train", "valid"), ("train", "test"), ("valid", "test")):
+            report["overlap"][f"{left}-{right}"] = {
+                "text": len(set(splits[left]["text"]) & set(splits[right]["text"])),
+                "group": len(set(splits[left]["group_id"]) & set(splits[right]["group_id"])),
+            }
+        version_payload = "".join(
+            sorted(item["sha256"] for item in self.file_reports)
+        ) + PREPROCESSING_VERSION
+        report["data_version"] = "combined-" + hashlib.sha256(version_payload.encode()).hexdigest()[:12]
+        return report
+
+    def run(self) -> dict[str, object]:
+        files = self.discover_files()
+        print(f"\n{len(files)} ham CSV bulundu:")
+        for path in files:
+            print(f"  - {path}")
+
+        frames = [self.load_and_standardize(path) for path in files]
+        combined = self.resolve_duplicates_and_conflicts(pd.concat(frames, ignore_index=True))
+        combined, group_stats = self.add_content_groups(combined)
+        splits = self.split(combined)
+
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        for name, part in splits.items():
+            part.to_csv(self.config.output_dir / f"{name}.csv", index=False, encoding="utf-8")
+        combined.to_csv(
+            self.config.output_dir / "birlesik_tum_veri.csv", index=False, encoding="utf-8"
+        )
+        self._write_quality_tables()
+
+        audit = self._build_audit(combined, splits, group_stats)
+        self.config.report_dir.mkdir(parents=True, exist_ok=True)
+        (self.config.report_dir / "data_audit.json").write_text(
+            json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (self.config.output_dir / "dataset_manifest.json").write_text(
+            json.dumps(
+                {
+                    "data_version": audit["data_version"],
+                    "preprocessing_version": PREPROCESSING_VERSION,
+                    "split_fingerprints": {
+                        name: audit["splits"][name]["sha256"] for name in splits
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        if self.config.generate_plots:
+            self._generate_plots(combined, splits)
+
+        print("\nTemizleme tamamlandı:")
+        for name in ("train", "valid", "test"):
+            print(f"  {name:5s}: {len(splits[name]):,}")
+        print(f"  veri sürümü: {audit['data_version']}")
+        print(f"  kalite raporu: {self.config.report_dir / 'data_audit.json'}")
+        return audit
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--input-dir",
+        action="append",
+        type=Path,
+        default=[],
+        help="Birden çok kez verilebilir. Verilmezse ham_veri ve eski veri klasörü aranır.",
+    )
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--report-dir", type=Path, default=None)
+    parser.add_argument("--min-words", type=int, default=1)
+    parser.add_argument("--max-characters", type=int, default=1500)
+    parser.add_argument("--test-ratio", type=float, default=0.15)
+    parser.add_argument("--valid-ratio", type=float, default=0.10)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--conflict-policy", choices=("quarantine", "error", "majority"), default="quarantine"
+    )
+    parser.add_argument("--no-near-duplicate-groups", action="store_true")
+    parser.add_argument("--near-duplicate-ratio", type=float, default=0.90)
+    parser.add_argument("--plots", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> dict[str, object]:
+    args = build_parser().parse_args(argv)
+    config = DataCleaningConfig(
+        input_dirs=tuple(args.input_dir),
+        output_dir=args.output_dir,
+        report_dir=args.report_dir,
+        min_words=args.min_words,
+        max_characters=args.max_characters,
+        test_ratio=args.test_ratio,
+        valid_ratio=args.valid_ratio,
+        random_seed=args.seed,
+        conflict_policy=args.conflict_policy,
+        group_near_duplicates=not args.no_near_duplicate_groups,
+        near_duplicate_ratio=args.near_duplicate_ratio,
+        generate_plots=args.plots,
+    )
+    return TurkishToxicDataCleaner(config).run()
+
+
+if __name__ == "__main__":
+    main()

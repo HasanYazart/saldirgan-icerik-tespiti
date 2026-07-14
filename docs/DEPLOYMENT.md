@@ -14,7 +14,7 @@
 ## Model
 
 - [ ] Model yeni `turkish-toxic-v2` akışıyla yeniden eğitildi
-- [ ] Test setine model, eşik veya ensemble seçimi sırasında bakılmadı
+- [ ] Test setine model veya eşik seçimi sırasında bakılmadı
 - [ ] Genel ve dilim bazlı hata oranları onaylandı
 - [ ] Canary veya shadow dağıtım yapıldı
 - [ ] Drift, latency, inceleme ve itiraz metrikleri için alarm var

@@ -1,1155 +1,1685 @@
 # -*- coding: utf-8 -*-
-"""
-===============================================================================
- DERİN ÖĞRENME YÖNTEMLERİ İLE SOSYAL MEDYADA SALDIRGAN İÇERİK TESPİTİ
- MODEL EĞİTİMİ - GOOGLE COLAB VERSİYONU (GELİŞMİŞ)
-===============================================================================
+"""Belge (3) uyumlu Word2Vec + CNN/LSTM ve BERT eğitim pipeline'ı.
 
-Anti-Overfitting Teknikleri:
-  ✅ L2 Regularization (kernel_regularizer)
-  ✅ BatchNormalization
-  ✅ Çoklu Dropout katmanları (SpatialDropout1D + Dropout)
-  ✅ EarlyStopping (patience=5)
-  ✅ ReduceLROnPlateau + CosineDecay
-  ✅ Label Smoothing
-  ✅ Class Weights (sınıf dengesizliği)
-  ✅ Gradient Clipping
-  ✅ Data Augmentation (Random Word Deletion)
+Öne çıkan korumalar:
+  * tokenizer/vectorizer yalnızca train ile öğrenilir;
+  * model ve eşik seçimi yalnızca validation üzerinde yapılır;
+  * test split'e eğitim, kalibrasyon veya model seçiminde dokunulmaz;
+  * Word2Vec yalnızca train metinleriyle öğrenilir;
+  * belgede önerilen CNN -> LSTM hibrit mimarisi uygulanır;
+  * Keras'ta token dropout, AdamW, L2, label smoothing ve early stopping;
+  * Transformer'da focal loss, AdamW, cosine schedule, warmup, gradient
+    checkpointing, mixed precision ve desteklenen GPU'larda torch.compile;
+  * olasılık kalibrasyonu ve hedef yanlış-pozitif oranına bağlı eşik.
 
-Performans Artırma:
-  ✅ Attention mekanizması (LSTM, BiLSTM)
-  ✅ Multi-kernel CNN (3, 4, 5 filtre boyutları)
-  ✅ Ensemble Model (tüm modellerin birleşimi)
-  ✅ BERT fine-tuning (discriminative learning rates)
-  ✅ Mixed Precision Training
-
-Kullanım (Google Colab):
-  1. Runtime > Change runtime type > T4 GPU
-  2. Hücre 1: !git clone https://github.com/HasanYazart/saldirgan-icerik-tespiti.git
-              !pip install -q transformers wordcloud
-  3. Hücre 2: %run saldirgan-icerik-tespiti/veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py
-===============================================================================
+Colab:
+    !pip install -e ".[colab]"
+    !python veri_temizlemesi_ve_egitimi/02_model_egitimi_colab.py --prepare-data --models lstm,cnn,cnn_lstm
 """
 
-# ============================================================================
-# HÜCRE 1: KURULUM VE GITHUB'DAN VERİ ÇEKME
-# ============================================================================
+from __future__ import annotations
 
-import os
-import json
+import argparse
+import gc
 import hashlib
+import json
+import math
+import os
+import platform
+import random
 import shutil
 import subprocess
-
-# GitHub repo URL
-GITHUB_REPO_URL = "https://github.com/HasanYazart/saldirgan-icerik-tespiti.git"
-
-# Colab kontrolü
-IN_COLAB = False
-try:
-    import google.colab
-    IN_COLAB = True
-    print("✅ Google Colab ortamı tespit edildi!")
-except ImportError:
-    print("⚠️ Yerel ortamda çalışıyorsunuz.")
-
-# Kütüphaneleri yükle
-if IN_COLAB:
-    print("\n📦 Gerekli kütüphaneler yükleniyor...")
-    subprocess.run(["pip", "install", "-q", "transformers", "wordcloud"], check=True)
-    print("✅ Kütüphaneler yüklendi!")
-
-# GitHub'dan repo klonla
-SCRIPT_KLASORU = os.path.dirname(os.path.abspath(__file__))
-PROJE_KLASORU = (
-    "/content/saldirgan-icerik-tespiti"
-    if IN_COLAB
-    else os.path.abspath(os.path.join(SCRIPT_KLASORU, ".."))
-)
-
-if IN_COLAB:
-    if os.path.exists(PROJE_KLASORU):
-        subprocess.run(["git", "-C", PROJE_KLASORU, "pull"], check=True)
-    else:
-        print(f"\n📥 GitHub'dan repo klonlanıyor...")
-        subprocess.run(["git", "clone", GITHUB_REPO_URL, PROJE_KLASORU], check=True)
-        print("✅ Repo klonlandı!")
-
-VERI_KLASORU  = os.path.join(PROJE_KLASORU, "veri_setleri")
-SONUC_KLASORU = os.path.join(PROJE_KLASORU, "sonuclar")
-MODEL_KLASORU = os.path.join(PROJE_KLASORU, "modeller")
-os.makedirs(SONUC_KLASORU, exist_ok=True)
-os.makedirs(MODEL_KLASORU, exist_ok=True)
-
-for f in ['train.csv', 'valid.csv', 'test.csv']:
-    yol = os.path.join(VERI_KLASORU, f)
-    print(f"   {'✅' if os.path.exists(yol) else '❌'} {f}")
-
-print(f"\n📁 Proje: {PROJE_KLASORU}")
-
-
-# ============================================================================
-# HÜCRE 2: KÜTÜPHANELERİ İÇE AKTAR VE GPU KONTROL
-# ============================================================================
-
 import sys
-import warnings
-import random
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Sequence
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime
-from collections import Counter
-
-if PROJE_KLASORU not in sys.path:
-    sys.path.insert(0, PROJE_KLASORU)
-from backend_api.text_processing import PREPROCESSING_VERSION, normalize_for_model
-
-warnings.filterwarnings('ignore')
-plt.rcParams['font.family'] = 'DejaVu Sans'
-plt.rcParams['figure.dpi'] = 100
-
-# TensorFlow
-import tensorflow as tf
-from tensorflow.keras import backend as K
-print(f"\n🔧 TensorFlow: {tf.__version__}")
-
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    print(f"🎮 GPU: {gpus}")
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-    # Mixed Precision Training (GPU varsa) - hızlandırır
-    tf.keras.mixed_precision.set_global_policy('mixed_float16')
-    print("⚡ Mixed Precision Training aktif!")
-else:
-    print("⚠️ GPU bulunamadı! Runtime > Change runtime type > T4 GPU")
-
-# PyTorch
-import torch
-print(f"🔧 PyTorch: {torch.__version__}")
-print(f"🎮 CUDA: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"   GPU: {torch.cuda.get_device_name(0)}")
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
-# ============================================================================
-# HÜCRE 3: HİPERPARAMETRELER
-# ============================================================================
-
-# Keras modelleri
-MAX_WORDS      = 50000       # Daha geniş vocabulary
-MAX_SEQ_LEN    = 250         # Daha uzun sekans
-EMBEDDING_DIM  = 256         # Daha zengin embedding
-LSTM_UNITS     = 128         # Daha güçlü LSTM
-CNN_FILTERS    = 256         # Daha fazla filtre
-DROPOUT_RATE   = 0.4         # Daha agresif dropout (overfitting önleme)
-BATCH_SIZE     = 64
-EPOCHS         = 20          # Daha fazla epoch (EarlyStopping durduracak)
-L2_REG         = 1e-4        # L2 Regularization
-LABEL_SMOOTH   = 0.1         # Label Smoothing
-
-# BERT
-BERT_MODEL_NAME = "dbmdz/bert-base-turkish-cased"
-BERT_MAX_LEN    = 128
-BERT_BATCH_SIZE = 32
-BERT_EPOCHS     = 4
-BERT_LR         = 2e-5
-TARGET_FPR      = 0.01
-BERT_WARMUP     = 0.1        # Warmup oranı
-
-# Seed
-RANDOM_SEED = 42
-np.random.seed(RANDOM_SEED)
-tf.random.set_seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
-random.seed(RANDOM_SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(RANDOM_SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-
-print("✅ Hiperparametreler ayarlandı!")
-print(f"   Dropout: {DROPOUT_RATE} | L2: {L2_REG} | Label Smoothing: {LABEL_SMOOTH}")
-print(f"   Max Epoch: {EPOCHS} (EarlyStopping ile otomatik durma)")
-
-
-# ============================================================================
-# HÜCRE 4: VERİ YÜKLEME VE SINIF AĞIRLIKLARI
-# ============================================================================
-
-print("\n" + "=" * 60)
-print("  VERİ YÜKLEME")
-print("=" * 60)
-
-df_train = pd.read_csv(os.path.join(VERI_KLASORU, "train.csv"), encoding='utf-8')
-df_valid = pd.read_csv(os.path.join(VERI_KLASORU, "valid.csv"), encoding='utf-8')
-df_test  = pd.read_csv(os.path.join(VERI_KLASORU, "test.csv"), encoding='utf-8')
-
-for df in [df_train, df_valid, df_test]:
-    df.dropna(subset=['text', 'label'], inplace=True)
-    df['text'] = df['text'].astype(str).map(normalize_for_model)
-    df['label'] = df['label'].astype(int)
-
-# ============================================================================
-# KÖKTEN ÇÖZÜM: HARD NEGATIVE INJECTION (FALSE POSITIVE ENGELLEYİCİ)
-# ============================================================================
-# Modelin 'git', 'mide', 'mal', 'meme' gibi kelimeleri doğrudan küfür
-# sanmasını (False Positive) engellemek için eğitim verisine 'Normal (0)'
-# etiketli zorlayıcı cümleler (Hard Negatives) enjekte ediyoruz.
-print("\n🛡️ Hard Negatives (Zorlayıcı Negatifler) eğitim setine ekleniyor...")
-hard_negatives = [
-    # Git / Mide türevleri
-    "mide git artık", "midem bulandı git", "git midem bulanıyor", "mide ağrım gitmedi",
-    "git işine", "hadi git buradan", "git artık lütfen", "eve git", "okula git",
-    "neden gitmiyorsun", "git de dinlen", "hastaneye git", "sinemaya git",
-
-    # Mal / Adi / Meme vb. türevleri
-    "mal varlığını sorguladılar", "mali durumumuz kötü", "bu mallar çok kaliteli",
-    "bu adil bir karar değil", "adi suçlar mahkemesi", "adi ortaklık",
-    "bu meme çok komik", "internet memesi paylaştı", "memeli hayvanlar",
-
-    # Sokak / Lanet / Ölüm vb.
-    "sokakta yürüyorduk", "sokak lambası", "sokak hayvanlarına yardım et",
-    "lanet olsun çok şanssızım", "gülmekten öldüm", "yorgunluktan bittim",
-    "öldüm bittim", "seni öldüresim var gülmekten",
-
-    # Diğer belirsiz olabilecek normal kullanımlar
-    "bana bak", "ne diyorsun", "saçmalama", "sus artık", "yeter", "aptalca bir hata yaptım"
-]
-
-# Hard negative'leri güçlendirmek için her cümleyi birkaç kez kopyalıyoruz
-df_hn = pd.DataFrame({'text': hard_negatives * 3, 'label': 0})
-df_train = pd.concat([df_train, df_hn], ignore_index=True)
-
-print(f"   Train:      {len(df_train):,} (+{len(df_hn)} Hard Negative)")
-print(f"   Validation: {len(df_valid):,}")
-print(f"   Test:       {len(df_test):,}")
-
-# Sınıf ağırlıkları hesapla (dengesizlik varsa telafi eder)
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_curve,
+    roc_auc_score,
+)
 from sklearn.utils.class_weight import compute_class_weight
 
-sinif_agirlik = compute_class_weight(
-    class_weight='balanced',
-    classes=np.array([0, 1]),
-    y=df_train['label'].values
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from backend_api.text_processing import PREPROCESSING_VERSION as BACKEND_PREPROCESSING_VERSION
+from veri_temizlemesi_ve_egitimi.document_preprocessing import (
+    PREPROCESSING_VERSION,
+    normalize_for_document,
 )
-class_weights = {0: sinif_agirlik[0], 1: sinif_agirlik[1]}
-print(f"\n⚖️ Sınıf ağırlıkları: Normal={class_weights[0]:.3f}, Saldırgan={class_weights[1]:.3f}")
 
 
-# ============================================================================
-# HÜCRE 5: DATA AUGMENTATION
-# ============================================================================
-
-def random_word_deletion(text, p=0.1):
-    """Rastgele kelime silme augmentation."""
-    words = text.split()
-    if len(words) <= 3:
-        return text
-    remaining = [w for w in words if random.random() > p]
-    if len(remaining) == 0:
-        return random.choice(words)
-    return ' '.join(remaining)
-
-def random_word_swap(text, n=1):
-    """Rastgele kelime yer değiştirme."""
-    words = text.split()
-    if len(words) < 2:
-        return text
-    for _ in range(n):
-        i, j = random.sample(range(len(words)), 2)
-        words[i], words[j] = words[j], words[i]
-    return ' '.join(words)
-
-# Saldırgan sınıf için augmentation (az olan sınıfı artır)
-print("\n🔄 Data Augmentation uygulanıyor...")
-augmented_rows = []
-minority_df = df_train[df_train['label'] == 1] if class_weights[1] > 1 else df_train[df_train['label'] == 0]
-
-for _, row in minority_df.sample(min(5000, len(minority_df)), random_state=RANDOM_SEED).iterrows():
-    aug_text = random_word_deletion(row['text'], p=0.15)
-    augmented_rows.append({'text': aug_text, 'label': row['label']})
-    aug_text2 = random_word_swap(row['text'], n=2)
-    augmented_rows.append({'text': aug_text2, 'label': row['label']})
-
-df_aug = pd.DataFrame(augmented_rows)
-df_train_aug = pd.concat([df_train, df_aug], ignore_index=True).sample(frac=1, random_state=RANDOM_SEED)
-
-print(f"   Orijinal train: {len(df_train):,}")
-print(f"   Augmented train: {len(df_train_aug):,} (+{len(df_aug):,} eklendi)")
-print(f"   Yeni dağılım: Normal={(df_train_aug['label']==0).sum():,}, Saldırgan={(df_train_aug['label']==1).sum():,}")
-
-# Sınıf ağırlıklarını yeniden hesapla
-sinif_agirlik = compute_class_weight('balanced', classes=np.array([0, 1]), y=df_train_aug['label'].values)
-class_weights = {0: sinif_agirlik[0], 1: sinif_agirlik[1]}
-print(f"   Güncel ağırlıklar: Normal={class_weights[0]:.3f}, Saldırgan={class_weights[1]:.3f}")
+try:
+    from transformers import Trainer as _TrainerBase
+except ImportError:  # Import-safe dry-run ve yardımcı fonksiyon testleri için.
+    class _TrainerBase:  # type: ignore[no-redef]
+        pass
 
 
-# ============================================================================
-# HÜCRE 6: YARDIMCI FONKSİYONLAR
-# ============================================================================
+def set_global_seed(
+    seed: int,
+    *,
+    seed_torch: bool = True,
+    seed_tensorflow: bool = True,
+) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    if seed_torch:
+        try:
+            import torch
 
-def performans_raporu_ciz(y_true, y_pred, y_prob, model_adi):
-    """Model performansını görselleştir ve raporla."""
-    from sklearn.metrics import (
-        classification_report, confusion_matrix,
-        roc_curve, auc, accuracy_score, f1_score,
-        precision_score, recall_score
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision("high")
+        except ImportError:
+            pass
+    if seed_tensorflow:
+        try:
+            import tensorflow as tf
+
+            tf.keras.utils.set_random_seed(seed)
+            try:
+                tf.config.experimental.enable_op_determinism()
+            except (AttributeError, RuntimeError):
+                pass
+        except ImportError:
+            pass
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def directory_sha256(directory: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(item for item in directory.rglob("*") if item.is_file()):
+        digest.update(path.relative_to(directory).as_posix().encode("utf-8"))
+        digest.update(bytes.fromhex(file_sha256(path)))
+    return digest.hexdigest()
+
+
+def frame_fingerprint(frame: pd.DataFrame) -> str:
+    columns = [
+        column for column in ("text", "label", "kaynak", "group_id") if column in frame
+    ]
+    payload = frame[columns].sort_values(columns).to_csv(index=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def stable_token_hash(token: str) -> int:
+    """Word2Vec başlangıç vektörlerini süreçler arasında tekrarlanabilir yapar."""
+
+    return int.from_bytes(
+        hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest(), "little"
     )
 
-    acc  = accuracy_score(y_true, y_pred)
-    f1   = f1_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred)
-    rec  = recall_score(y_true, y_pred)
-
-    print(f"\n{'='*60}")
-    print(f"   📊 {model_adi} - TEST SONUÇLARI")
-    print(f"{'='*60}")
-    print(f"   Accuracy:  {acc:.4f}")
-    print(f"   Precision: {prec:.4f}")
-    print(f"   Recall:    {rec:.4f}")
-    print(f"   F1-Score:  {f1:.4f}")
-    print(f"\n{classification_report(y_true, y_pred, target_names=['Normal', 'Saldırgan'])}")
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    cm = confusion_matrix(y_true, y_pred)
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0],
-                xticklabels=['Normal', 'Saldırgan'], yticklabels=['Normal', 'Saldırgan'])
-    axes[0].set_title(f'{model_adi} - Confusion Matrix', fontsize=14, fontweight='bold')
-    axes[0].set_xlabel('Tahmin'); axes[0].set_ylabel('Gerçek')
-
-    roc_auc_val = None
-    if y_prob is not None:
-        fpr, tpr, _ = roc_curve(y_true, y_prob)
-        roc_auc_val = auc(fpr, tpr)
-        axes[1].plot(fpr, tpr, color='#e74c3c', lw=2, label=f'ROC (AUC = {roc_auc_val:.4f})')
-        axes[1].plot([0, 1], [0, 1], color='gray', lw=1, linestyle='--')
-        axes[1].set_xlim([0, 1]); axes[1].set_ylim([0, 1.05])
-        axes[1].set_xlabel('FPR'); axes[1].set_ylabel('TPR')
-        axes[1].set_title(f'{model_adi} - ROC Eğrisi', fontsize=14, fontweight='bold')
-        axes[1].legend(fontsize=12)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(SONUC_KLASORU, f'{model_adi}_sonuclar.png'), dpi=150, bbox_inches='tight')
-    plt.show()
-
-    return {'model': model_adi, 'accuracy': acc, 'precision': prec,
-            'recall': rec, 'f1_score': f1, 'roc_auc': roc_auc_val}
-
-
-def egitim_grafigi_ciz(history, model_adi):
-    """Eğitim/doğrulama grafiği + overfitting analizi."""
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-    # Accuracy
-    axes[0].plot(history.history['accuracy'], label='Train', color='#3498db', lw=2)
-    axes[0].plot(history.history['val_accuracy'], label='Validation', color='#e74c3c', lw=2)
-    axes[0].set_title(f'{model_adi} - Accuracy', fontsize=14, fontweight='bold')
-    axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Accuracy')
-    axes[0].legend(); axes[0].grid(True, alpha=0.3)
-
-    # Loss
-    axes[1].plot(history.history['loss'], label='Train', color='#3498db', lw=2)
-    axes[1].plot(history.history['val_loss'], label='Validation', color='#e74c3c', lw=2)
-    axes[1].set_title(f'{model_adi} - Loss', fontsize=14, fontweight='bold')
-    axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('Loss')
-    axes[1].legend(); axes[1].grid(True, alpha=0.3)
-
-    # Overfitting Gap (Train-Val farkı)
-    train_acc = history.history['accuracy']
-    val_acc = history.history['val_accuracy']
-    gap = [t - v for t, v in zip(train_acc, val_acc)]
-    axes[2].plot(gap, color='#e67e22', lw=2, marker='o')
-    axes[2].axhline(y=0, color='green', linestyle='--', alpha=0.5)
-    axes[2].fill_between(range(len(gap)), gap, alpha=0.3, color='#e67e22')
-    axes[2].set_title(f'{model_adi} - Overfitting Gap', fontsize=14, fontweight='bold')
-    axes[2].set_xlabel('Epoch'); axes[2].set_ylabel('Train Acc - Val Acc')
-    axes[2].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(SONUC_KLASORU, f'{model_adi}_egitim.png'), dpi=150, bbox_inches='tight')
-    plt.show()
-
-    # Overfitting uyarısı
-    final_gap = gap[-1] if gap else 0
-    if final_gap > 0.05:
-        print(f"   ⚠️ Overfitting riski: Train-Val gap = {final_gap:.4f}")
-    else:
-        print(f"   ✅ Overfitting yok: Train-Val gap = {final_gap:.4f}")
-
-
-print("✅ Yardımcı fonksiyonlar tanımlandı!")
-
-
-# ============================================================================
-# HÜCRE 7: TOKENİZATİON (ORTAK)
-# ============================================================================
-
-from tensorflow.keras.preprocessing.text import Tokenizer
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-
-print("\n🔤 Tokenization başlıyor...")
-tokenizer = Tokenizer(num_words=MAX_WORDS, oov_token='<OOV>')
-tokenizer.fit_on_texts(df_train_aug['text'].values)
-
-X_train_seq = pad_sequences(tokenizer.texts_to_sequences(df_train_aug['text'].values),
-                            maxlen=MAX_SEQ_LEN, padding='post', truncating='post')
-X_valid_seq = pad_sequences(tokenizer.texts_to_sequences(df_valid['text'].values),
-                            maxlen=MAX_SEQ_LEN, padding='post', truncating='post')
-X_test_seq  = pad_sequences(tokenizer.texts_to_sequences(df_test['text'].values),
-                            maxlen=MAX_SEQ_LEN, padding='post', truncating='post')
-
-y_train = df_train_aug['label'].values
-y_valid = df_valid['label'].values
-y_test  = df_test['label'].values
-
-vocab_size = min(MAX_WORDS, len(tokenizer.word_index) + 1)
-print(f"   Vocabulary: {vocab_size:,} | Sekans: {MAX_SEQ_LEN}")
-print(f"   Train: {X_train_seq.shape} | Valid: {X_valid_seq.shape} | Test: {X_test_seq.shape}")
-
-
-# ============================================================================
-# HÜCRE 8: ATTENTION KATMANI (CUSTOM)
-# ============================================================================
-
-from tensorflow.keras import layers, Model, regularizers
-
-class AttentionLayer(layers.Layer):
-    """Bahdanau Attention mekanizması - hangi kelimelere odaklanılacağını öğrenir."""
-    def __init__(self, **kwargs):
-        super(AttentionLayer, self).__init__(**kwargs)
-
-    def build(self, input_shape):
-        self.W = self.add_weight(name='att_weight',
-                                 shape=(input_shape[-1], input_shape[-1]),
-                                 initializer='glorot_uniform', trainable=True)
-        self.b = self.add_weight(name='att_bias',
-                                 shape=(input_shape[-1],),
-                                 initializer='zeros', trainable=True)
-        self.u = self.add_weight(name='att_context',
-                                 shape=(input_shape[-1],),
-                                 initializer='glorot_uniform', trainable=True)
-
-    def call(self, x):
-        # x shape: (batch, timesteps, features)
-        score = tf.nn.tanh(tf.tensordot(x, self.W, axes=1) + self.b)
-        attention_weights = tf.nn.softmax(tf.tensordot(score, self.u, axes=1), axis=1)
-        context_vector = tf.reduce_sum(x * tf.expand_dims(attention_weights, -1), axis=1)
-        return context_vector
-
-print("✅ Attention katmanı tanımlandı!")
-
-
-# ============================================================================
-# ORTAK CALLBACK'LER
-# ============================================================================
-
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
-
-callbacks = [
-    EarlyStopping(
-        monitor='val_loss', patience=5,
-        restore_best_weights=True, verbose=1,
-        min_delta=0.001  # Minimum iyileşme eşiği
-    ),
-    ReduceLROnPlateau(
-        monitor='val_loss', factor=0.3,
-        patience=2, verbose=1, min_lr=1e-7
-    )
-]
-
-
-# ============================================================================
-# HÜCRE 9: MODEL 1 - LSTM + ATTENTION
-# ============================================================================
-
-print("\n" + "=" * 60)
-print("   🚀 MODEL 1: LSTM + Attention")
-print("=" * 60)
-
-# Fonksiyonel API (Attention için gerekli)
-inp = layers.Input(shape=(MAX_SEQ_LEN,))
-x = layers.Embedding(vocab_size, EMBEDDING_DIM, input_length=MAX_SEQ_LEN)(inp)
-x = layers.SpatialDropout1D(0.3)(x)
-x = layers.LSTM(LSTM_UNITS, return_sequences=True,
-                kernel_regularizer=regularizers.l2(L2_REG),
-                recurrent_regularizer=regularizers.l2(L2_REG))(x)
-x = layers.BatchNormalization()(x)
-x = layers.Dropout(DROPOUT_RATE)(x)
-x = AttentionLayer()(x)
-x = layers.BatchNormalization()(x)
-x = layers.Dense(64, activation='relu', kernel_regularizer=regularizers.l2(L2_REG))(x)
-x = layers.Dropout(DROPOUT_RATE)(x)
-x = layers.Dense(32, activation='relu', kernel_regularizer=regularizers.l2(L2_REG))(x)
-x = layers.Dropout(0.2)(x)
-# float32 çıkış (mixed precision uyumluluğu)
-out = layers.Dense(1, activation='sigmoid', dtype='float32')(x)
-
-lstm_model = Model(inputs=inp, outputs=out)
-lstm_model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0),
-    loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=LABEL_SMOOTH),
-    metrics=['accuracy']
-)
-lstm_model.summary()
-
-basla = datetime.now()
-lstm_history = lstm_model.fit(
-    X_train_seq, y_train,
-    validation_data=(X_valid_seq, y_valid),
-    epochs=EPOCHS, batch_size=BATCH_SIZE,
-    callbacks=callbacks, class_weight=class_weights, verbose=1
-)
-print(f"\n⏱️ LSTM süresi: {datetime.now() - basla}")
-
-egitim_grafigi_ciz(lstm_history, 'LSTM_Attention')
-
-lstm_prob = lstm_model.predict(X_test_seq, verbose=0).flatten()
-lstm_pred = (lstm_prob >= 0.5).astype(int)
-lstm_sonuc = performans_raporu_ciz(y_test, lstm_pred, lstm_prob, 'LSTM_Attention')
-lstm_model.save(os.path.join(MODEL_KLASORU, 'lstm_attention.keras'))
-print("✅ LSTM + Attention kaydedildi!")
-
-
-# ============================================================================
-# HÜCRE 10: MODEL 2 - BiLSTM + ATTENTION
-# ============================================================================
-
-print("\n" + "=" * 60)
-print("   🚀 MODEL 2: BiLSTM + Attention")
-print("=" * 60)
-
-inp = layers.Input(shape=(MAX_SEQ_LEN,))
-x = layers.Embedding(vocab_size, EMBEDDING_DIM, input_length=MAX_SEQ_LEN)(inp)
-x = layers.SpatialDropout1D(0.3)(x)
-x = layers.Bidirectional(layers.LSTM(LSTM_UNITS, return_sequences=True,
-                                      kernel_regularizer=regularizers.l2(L2_REG),
-                                      recurrent_regularizer=regularizers.l2(L2_REG)))(x)
-x = layers.BatchNormalization()(x)
-x = layers.Dropout(DROPOUT_RATE)(x)
-x = AttentionLayer()(x)
-x = layers.BatchNormalization()(x)
-x = layers.Dense(64, activation='relu', kernel_regularizer=regularizers.l2(L2_REG))(x)
-x = layers.Dropout(DROPOUT_RATE)(x)
-x = layers.Dense(32, activation='relu', kernel_regularizer=regularizers.l2(L2_REG))(x)
-x = layers.Dropout(0.2)(x)
-out = layers.Dense(1, activation='sigmoid', dtype='float32')(x)
-
-bilstm_model = Model(inputs=inp, outputs=out)
-bilstm_model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0),
-    loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=LABEL_SMOOTH),
-    metrics=['accuracy']
-)
-bilstm_model.summary()
-
-basla = datetime.now()
-bilstm_history = bilstm_model.fit(
-    X_train_seq, y_train,
-    validation_data=(X_valid_seq, y_valid),
-    epochs=EPOCHS, batch_size=BATCH_SIZE,
-    callbacks=callbacks, class_weight=class_weights, verbose=1
-)
-print(f"\n⏱️ BiLSTM süresi: {datetime.now() - basla}")
-
-egitim_grafigi_ciz(bilstm_history, 'BiLSTM_Attention')
-
-bilstm_prob = bilstm_model.predict(X_test_seq, verbose=0).flatten()
-bilstm_pred = (bilstm_prob >= 0.5).astype(int)
-bilstm_sonuc = performans_raporu_ciz(y_test, bilstm_pred, bilstm_prob, 'BiLSTM_Attention')
-bilstm_model.save(os.path.join(MODEL_KLASORU, 'bilstm_attention.keras'))
-print("✅ BiLSTM + Attention kaydedildi!")
-
-
-# ============================================================================
-# HÜCRE 11: MODEL 3 - MULTI-KERNEL CNN
-# ============================================================================
-
-print("\n" + "=" * 60)
-print("   🚀 MODEL 3: Multi-Kernel CNN")
-print("=" * 60)
-
-# Birden fazla filtre boyutu ile paralel konvolüsyon
-inp = layers.Input(shape=(MAX_SEQ_LEN,))
-emb = layers.Embedding(vocab_size, EMBEDDING_DIM, input_length=MAX_SEQ_LEN)(inp)
-emb = layers.SpatialDropout1D(0.3)(emb)
-
-# Paralel CNN dalları (3, 4, 5 kernel boyutları)
-conv_outputs = []
-for kernel_size in [3, 4, 5]:
-    c = layers.Conv1D(CNN_FILTERS, kernel_size=kernel_size, activation='relu',
-                      kernel_regularizer=regularizers.l2(L2_REG))(emb)
-    c = layers.BatchNormalization()(c)
-    c = layers.GlobalMaxPooling1D()(c)
-    conv_outputs.append(c)
-
-# Birleştir
-x = layers.Concatenate()(conv_outputs)
-x = layers.BatchNormalization()(x)
-x = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l2(L2_REG))(x)
-x = layers.Dropout(DROPOUT_RATE)(x)
-x = layers.Dense(64, activation='relu', kernel_regularizer=regularizers.l2(L2_REG))(x)
-x = layers.Dropout(DROPOUT_RATE)(x)
-x = layers.Dense(32, activation='relu')(x)
-x = layers.Dropout(0.2)(x)
-out = layers.Dense(1, activation='sigmoid', dtype='float32')(x)
-
-cnn_model = Model(inputs=inp, outputs=out)
-cnn_model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0),
-    loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=LABEL_SMOOTH),
-    metrics=['accuracy']
-)
-cnn_model.summary()
-
-basla = datetime.now()
-cnn_history = cnn_model.fit(
-    X_train_seq, y_train,
-    validation_data=(X_valid_seq, y_valid),
-    epochs=EPOCHS, batch_size=BATCH_SIZE,
-    callbacks=callbacks, class_weight=class_weights, verbose=1
-)
-print(f"\n⏱️ CNN süresi: {datetime.now() - basla}")
-
-egitim_grafigi_ciz(cnn_history, 'MultiKernel_CNN')
-
-cnn_prob = cnn_model.predict(X_test_seq, verbose=0).flatten()
-cnn_pred = (cnn_prob >= 0.5).astype(int)
-cnn_sonuc = performans_raporu_ciz(y_test, cnn_pred, cnn_prob, 'MultiKernel_CNN')
-cnn_model.save(os.path.join(MODEL_KLASORU, 'multikernel_cnn.keras'))
-print("✅ Multi-Kernel CNN kaydedildi!")
-
-
-# ============================================================================
-# HÜCRE 12: MODEL 4 - BERT (GELİŞMİŞ)
-# ============================================================================
-
-print("\n" + "=" * 60)
-print(f"   🚀 MODEL 4: BERT ({BERT_MODEL_NAME})")
-print("=" * 60)
-
-from transformers import BertTokenizer, BertForSequenceClassification
-from transformers import get_linear_schedule_with_warmup
-from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import autocast, GradScaler
-
-bert_tokenizer = BertTokenizer.from_pretrained(BERT_MODEL_NAME)
-print("✅ BERT Tokenizer yüklendi!")
-
-class ToxicDataset(Dataset):
-    def __init__(self, texts, labels, tokenizer, max_len):
-        self.texts = texts; self.labels = labels
-        self.tokenizer = tokenizer; self.max_len = max_len
-
-    def __len__(self): return len(self.texts)
-
-    def __getitem__(self, idx):
-        encoding = self.tokenizer(
-            str(self.texts[idx]), add_special_tokens=True,
-            max_length=self.max_len, padding='max_length',
-            truncation=True, return_attention_mask=True, return_tensors='pt'
+
+@dataclass(slots=True)
+class TrainingConfig:
+    project_dir: Path = PROJECT_DIR
+    data_dir: Path | None = None
+    result_dir: Path | None = None
+    model_dir: Path | None = None
+    models: tuple[str, ...] = ("lstm", "cnn", "cnn_lstm")
+    seed: int = 42
+    target_false_positive_rate: float = 0.01
+    deploy_backend: bool = False
+
+    # Keras
+    max_tokens: int = 50_000
+    sequence_length: int = 192
+    embedding_dim: int = 192
+    word2vec_window: int = 5
+    word2vec_min_count: int = 2
+    word2vec_epochs: int = 10
+    recurrent_units: int = 96
+    cnn_filters: int = 192
+    dropout: float = 0.45
+    token_dropout: float = 0.08
+    l2_regularization: float = 1e-4
+    label_smoothing: float = 0.05
+    keras_learning_rate: float = 3e-4
+    keras_batch_size: int = 64
+    keras_epochs: int = 30
+    keras_patience: int = 5
+
+    # Transformer
+    transformer_model: str = "dbmdz/bert-base-turkish-cased"
+    transformer_max_length: int = 160
+    transformer_batch_size: int = 16
+    transformer_eval_batch_size: int = 32
+    transformer_epochs: float = 3.0
+    transformer_learning_rate: float = 2e-5
+    transformer_weight_decay: float = 0.02
+    transformer_warmup_ratio: float = 0.10
+    transformer_gradient_accumulation: int = 2
+    transformer_patience: int = 2
+    focal_gamma: float = 2.0
+    # Colab'in sik kullandigi T4 ortaminda derleme ilk calistirmayi ciddi
+    # uzatabildigi ve surum uyumsuzluklarina acik oldugu icin opt-in'dir.
+    torch_compile: bool = False
+    gradient_checkpointing: bool = True
+    resume_from_checkpoint: Path | str | None = None
+
+    def __post_init__(self) -> None:
+        self.project_dir = Path(self.project_dir).resolve()
+        self.data_dir = Path(self.data_dir or self.project_dir / "veri_setleri").resolve()
+        self.result_dir = Path(self.result_dir or self.project_dir / "sonuclar").resolve()
+        self.model_dir = Path(self.model_dir or self.project_dir / "modeller").resolve()
+        if self.resume_from_checkpoint not in (None, "auto"):
+            self.resume_from_checkpoint = Path(self.resume_from_checkpoint).resolve()
+        self.models = tuple(name.strip().lower() for name in self.models if name.strip())
+        unknown = set(self.models) - {"lstm", "cnn", "cnn_lstm", "bert"}
+        if unknown:
+            raise ValueError(f"Bilinmeyen modeller: {sorted(unknown)}")
+        if not 0 < self.target_false_positive_rate < 1:
+            raise ValueError("target_false_positive_rate 0-1 arasında olmalı")
+        if self.word2vec_epochs < 1 or self.word2vec_min_count < 1:
+            raise ValueError("Word2Vec epochs ve min_count en az 1 olmalı")
+        if not self.models:
+            raise ValueError("En az bir model seçilmeli")
+
+
+class TrainingDataModule:
+    """Split'leri yükler ve eğitim başlamadan veri sızıntısını reddeder."""
+
+    def __init__(self, config: TrainingConfig) -> None:
+        self.config = config
+        self.frames: dict[str, pd.DataFrame] = {}
+        self.dataset_manifest: dict[str, Any] = {}
+
+    def load(self) -> "TrainingDataModule":
+        manifest_path = self.config.data_dir / "dataset_manifest.json"
+        has_manifest = manifest_path.exists()
+        if has_manifest:
+            self.dataset_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            expected = self.dataset_manifest.get("preprocessing_version")
+            if expected != PREPROCESSING_VERSION:
+                raise ValueError(
+                    f"Ön işleme sürümü uyuşmuyor: veri={expected}, kod={PREPROCESSING_VERSION}"
+                )
+
+        for split in ("train", "valid", "test"):
+            path = self.config.data_dir / f"{split}.csv"
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"{path} bulunamadı. Önce 01_veri_temizleme.py çalıştırın."
+                )
+            # group_id yalnizca rakamlardan olusabildiginde otomatik sayisal
+            # tur cikarimi bastaki sifirlari silebilir ve manifest hash'ini
+            # bozabilir. Etiket asagida kontrollu olarak yeniden sayiya cevrilir.
+            frame = pd.read_csv(path, dtype=str)
+            missing = {"text", "label"} - set(frame.columns)
+            if missing:
+                raise ValueError(f"{path}: eksik sütunlar {sorted(missing)}")
+            frame = frame.copy()
+            if has_manifest:
+                # Manifestli split temizleme pipeline'inda zaten tam bir kez
+                # normalize edilmistir. Leetspeak cozumunden sonra yeni bir
+                # hashtag deseni olusabildigi icin ikinci normalizasyon her
+                # metinde idempotent degildir ve veri parmak izini bozar.
+                frame["text"] = frame["text"].fillna("").astype(str)
+            else:
+                # Eski, manifestsiz splitler icin geriye uyumluluk.
+                frame["text"] = frame["text"].map(normalize_for_document)
+            frame["label"] = pd.to_numeric(frame["label"], errors="raise").astype("int8")
+            if not set(frame["label"].unique()).issubset({0, 1}):
+                raise ValueError(f"{path}: etiketler yalnızca 0/1 olabilir")
+            if frame["text"].eq("").any():
+                raise ValueError(f"{path}: boş metin bulundu")
+            if frame["text"].duplicated().any():
+                raise ValueError(f"{path}: normalize edilmiş yinelenen metin bulundu")
+            self.frames[split] = frame.reset_index(drop=True)
+
+        if has_manifest:
+            expected_fingerprints = self.dataset_manifest.get("split_fingerprints", {})
+            for split, frame in self.frames.items():
+                expected_fingerprint = expected_fingerprints.get(split)
+                if expected_fingerprint and frame_fingerprint(frame) != expected_fingerprint:
+                    raise ValueError(
+                        f"{split}.csv parmak izi manifestle uyuşmuyor; veri değiştirilmiş olabilir"
+                    )
+        self._assert_no_leakage()
+        self._print_summary()
+        return self
+
+    def _assert_no_leakage(self) -> None:
+        for left, right in (("train", "valid"), ("train", "test"), ("valid", "test")):
+            text_overlap = set(self.frames[left]["text"]) & set(self.frames[right]["text"])
+            if text_overlap:
+                raise ValueError(f"{left}-{right} arasında {len(text_overlap)} aynı metin var")
+            if "group_id" in self.frames[left] and "group_id" in self.frames[right]:
+                group_overlap = set(self.frames[left]["group_id"]) & set(
+                    self.frames[right]["group_id"]
+                )
+                if group_overlap:
+                    raise ValueError(
+                        f"{left}-{right} arasında {len(group_overlap)} yakın-kopya grubu var"
+                    )
+
+    def _print_summary(self) -> None:
+        print("\nVeri özeti")
+        for name, frame in self.frames.items():
+            distribution = frame["label"].value_counts().sort_index().to_dict()
+            print(f"  {name:5s}: {len(frame):,} | sınıflar={distribution}")
+
+    @property
+    def train(self) -> pd.DataFrame:
+        return self.frames["train"]
+
+    @property
+    def valid(self) -> pd.DataFrame:
+        return self.frames["valid"]
+
+    @property
+    def test(self) -> pd.DataFrame:
+        return self.frames["test"]
+
+    def class_weights(self) -> dict[int, float]:
+        labels = self.train["label"].to_numpy()
+        values = compute_class_weight("balanced", classes=np.array([0, 1]), y=labels)
+        # Aşırı ağırlıklar kararsız eğitime neden olmasın.
+        values = np.clip(values, 0.25, 4.0)
+        return {0: float(values[0]), 1: float(values[1])}
+
+
+class TemperatureScaler:
+    """Validation NLL ile tek parametreli olasılık kalibrasyonu."""
+
+    def __init__(self, temperature: float = 1.0) -> None:
+        self.temperature = float(temperature)
+
+    @staticmethod
+    def _logit(probabilities: np.ndarray) -> np.ndarray:
+        probabilities = np.clip(np.asarray(probabilities, dtype=np.float64), 1e-6, 1 - 1e-6)
+        return np.log(probabilities / (1 - probabilities))
+
+    def fit(self, probabilities: np.ndarray, labels: np.ndarray) -> "TemperatureScaler":
+        labels = np.asarray(labels, dtype=np.float64)
+        if len(np.unique(labels)) < 2:
+            self.temperature = 1.0
+            return self
+        logits = self._logit(probabilities)
+        candidates = np.exp(np.linspace(math.log(0.35), math.log(4.0), 240))
+        best = (float("inf"), 1.0)
+        for temperature in candidates:
+            calibrated = 1 / (1 + np.exp(-np.clip(logits / temperature, -40, 40)))
+            nll = -np.mean(
+                labels * np.log(np.clip(calibrated, 1e-8, 1))
+                + (1 - labels) * np.log(np.clip(1 - calibrated, 1e-8, 1))
+            )
+            if nll < best[0]:
+                best = (float(nll), float(temperature))
+        self.temperature = best[1]
+        return self
+
+    def transform(self, probabilities: np.ndarray) -> np.ndarray:
+        logits = self._logit(probabilities) / self.temperature
+        return 1 / (1 + np.exp(-np.clip(logits, -40, 40)))
+
+
+class ThresholdOptimizer:
+    """Validation'da FPR bütçesini aşmadan en yüksek F1 eşiğini seçer."""
+
+    def __init__(self, target_fpr: float) -> None:
+        self.target_fpr = target_fpr
+
+    def select(self, probabilities: np.ndarray, labels: np.ndarray) -> tuple[float, dict[str, float]]:
+        probabilities = np.asarray(probabilities)
+        labels = np.asarray(labels).astype(int)
+        candidates = np.unique(
+            np.concatenate([np.linspace(0.50, 0.999, 750), np.quantile(probabilities, np.linspace(0, 1, 250))])
         )
+        best: tuple[tuple[float, float, float, float], float, dict[str, float]] | None = None
+        for threshold in candidates:
+            if not 0.50 <= threshold <= 0.999:
+                continue
+            predictions = (probabilities >= threshold).astype(int)
+            tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
+            fpr = fp / max(fp + tn, 1)
+            if fpr > self.target_fpr:
+                continue
+            f1 = f1_score(labels, predictions, zero_division=0)
+            recall = recall_score(labels, predictions, zero_division=0)
+            precision = precision_score(labels, predictions, zero_division=0)
+            rank = (f1, recall, precision, -float(threshold))
+            details = {
+                "f1": float(f1),
+                "precision": float(precision),
+                "recall": float(recall),
+                "false_positive_rate": float(fpr),
+                "false_positives": int(fp),
+                "false_negatives": int(fn),
+            }
+            if best is None or rank > best[0]:
+                best = (rank, float(threshold), details)
+        if best is None:
+            threshold = 0.999
+            predictions = (probabilities >= threshold).astype(int)
+            tn, fp, fn, _ = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
+            return threshold, {
+                "f1": float(f1_score(labels, predictions, zero_division=0)),
+                "precision": float(precision_score(labels, predictions, zero_division=0)),
+                "recall": float(recall_score(labels, predictions, zero_division=0)),
+                "false_positive_rate": float(fp / max(fp + tn, 1)),
+                "false_positives": int(fp),
+                "false_negatives": int(fn),
+            }
+        return best[1], best[2]
+
+
+def expected_calibration_error(
+    labels: np.ndarray, probabilities: np.ndarray, bins: int = 15
+) -> float:
+    labels = np.asarray(labels)
+    probabilities = np.asarray(probabilities)
+    boundaries = np.linspace(0, 1, bins + 1)
+    error = 0.0
+    for lower, upper in zip(boundaries[:-1], boundaries[1:]):
+        mask = (probabilities > lower) & (probabilities <= upper)
+        if not mask.any():
+            continue
+        error += mask.mean() * abs(labels[mask].mean() - probabilities[mask].mean())
+    return float(error)
+
+
+def calculate_metrics(
+    labels: np.ndarray, probabilities: np.ndarray, threshold: float
+) -> dict[str, float]:
+    labels = np.asarray(labels).astype(int)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    predictions = (probabilities >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
+    per_class_precision = precision_score(
+        labels, predictions, labels=[0, 1], average=None, zero_division=0
+    )
+    per_class_recall = recall_score(
+        labels, predictions, labels=[0, 1], average=None, zero_division=0
+    )
+    per_class_f1 = f1_score(
+        labels, predictions, labels=[0, 1], average=None, zero_division=0
+    )
+    metrics = {
+        "threshold": float(threshold),
+        "accuracy": float(accuracy_score(labels, predictions)),
+        "balanced_accuracy": float(balanced_accuracy_score(labels, predictions)),
+        "precision": float(precision_score(labels, predictions, zero_division=0)),
+        "recall": float(recall_score(labels, predictions, zero_division=0)),
+        "f1": float(f1_score(labels, predictions, zero_division=0)),
+        "mcc": float(matthews_corrcoef(labels, predictions)),
+        "false_positive_rate": float(fp / max(fp + tn, 1)),
+        "false_negative_rate": float(fn / max(fn + tp, 1)),
+        "class_0_precision": float(per_class_precision[0]),
+        "class_0_recall": float(per_class_recall[0]),
+        "class_0_f1": float(per_class_f1[0]),
+        "class_1_precision": float(per_class_precision[1]),
+        "class_1_recall": float(per_class_recall[1]),
+        "class_1_f1": float(per_class_f1[1]),
+        "true_negatives": int(tn),
+        "false_positives": int(fp),
+        "false_negatives": int(fn),
+        "true_positives": int(tp),
+        "pr_auc": float(average_precision_score(labels, probabilities)),
+        "brier": float(brier_score_loss(labels, probabilities)),
+        "ece": expected_calibration_error(labels, probabilities),
+    }
+    try:
+        metrics["roc_auc"] = float(roc_auc_score(labels, probabilities))
+    except ValueError:
+        metrics["roc_auc"] = float("nan")
+    return metrics
+
+
+@dataclass(slots=True)
+class PredictionBundle:
+    model_name: str
+    temperature: float
+    threshold: float
+    validation_metrics: dict[str, float]
+    test_metrics: dict[str, float]
+    artifact: str
+
+
+class BaseModelTrainer:
+    def __init__(self, config: TrainingConfig, data: TrainingDataModule) -> None:
+        self.config = config
+        self.data = data
+
+    def _calibrate_and_evaluate(
+        self,
+        model_name: str,
+        validation_probabilities: np.ndarray,
+        test_probabilities: np.ndarray,
+        artifact: Path,
+    ) -> PredictionBundle:
+        validation_labels = self.data.valid["label"].to_numpy()
+        test_labels = self.data.test["label"].to_numpy()
+        scaler = TemperatureScaler().fit(validation_probabilities, validation_labels)
+        calibrated_validation = scaler.transform(validation_probabilities)
+        calibrated_test = scaler.transform(test_probabilities)
+        threshold, _ = ThresholdOptimizer(self.config.target_false_positive_rate).select(
+            calibrated_validation, validation_labels
+        )
+        self._save_evaluation_plots(
+            model_name,
+            validation_labels,
+            calibrated_validation,
+            test_labels,
+            calibrated_test,
+            threshold,
+        )
+        return PredictionBundle(
+            model_name=model_name,
+            temperature=scaler.temperature,
+            threshold=threshold,
+            validation_metrics=calculate_metrics(validation_labels, calibrated_validation, threshold),
+            test_metrics=calculate_metrics(test_labels, calibrated_test, threshold),
+            artifact=str(artifact),
+        )
+
+    def _save_evaluation_plots(
+        self,
+        model_name: str,
+        validation_labels: np.ndarray,
+        validation_probabilities: np.ndarray,
+        test_labels: np.ndarray,
+        test_probabilities: np.ndarray,
+        threshold: float,
+    ) -> None:
+        """Kalibrasyon ve test değerlendirmesinden üretilebilen tanı grafiklerini kaydet."""
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        plot_dir = self.config.result_dir / "grafikler"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        sns.set_theme(style="whitegrid", context="notebook")
+        display_name = model_name.upper()
+
+        def save(figure: Any, suffix: str) -> None:
+            figure.tight_layout()
+            figure.savefig(
+                plot_dir / f"{model_name}_{suffix}.png",
+                dpi=170,
+                bbox_inches="tight",
+            )
+            plt.close(figure)
+
+        predictions = (test_probabilities >= threshold).astype(np.int8)
+        matrix = confusion_matrix(test_labels, predictions, labels=[0, 1])
+        normalized = matrix / np.maximum(matrix.sum(axis=1, keepdims=True), 1)
+        figure, axes = plt.subplots(1, 2, figsize=(12, 5))
+        sns.heatmap(
+            matrix,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            cbar=False,
+            xticklabels=["Temiz", "Saldırgan"],
+            yticklabels=["Temiz", "Saldırgan"],
+            ax=axes[0],
+        )
+        axes[0].set_title(f"{display_name} test karmaşıklık matrisi")
+        axes[0].set_xlabel("Tahmin")
+        axes[0].set_ylabel("Gerçek")
+        sns.heatmap(
+            normalized,
+            annot=True,
+            fmt=".1%",
+            cmap="Blues",
+            vmin=0,
+            vmax=1,
+            cbar=False,
+            xticklabels=["Temiz", "Saldırgan"],
+            yticklabels=["Temiz", "Saldırgan"],
+            ax=axes[1],
+        )
+        axes[1].set_title("Satır-normalize karmaşıklık matrisi")
+        axes[1].set_xlabel("Tahmin")
+        axes[1].set_ylabel("Gerçek")
+        save(figure, "01_confusion_matrix")
+
+        figure, ax = plt.subplots(figsize=(7, 6))
+        for labels, probabilities, split_name in (
+            (validation_labels, validation_probabilities, "Validation"),
+            (test_labels, test_probabilities, "Test"),
+        ):
+            fpr, tpr, _ = roc_curve(labels, probabilities)
+            score = roc_auc_score(labels, probabilities)
+            ax.plot(fpr, tpr, linewidth=2, label=f"{split_name} (AUC={score:.4f})")
+        ax.plot([0, 1], [0, 1], "--", color="gray", label="Rastgele")
+        ax.set(xlabel="Yanlış pozitif oranı", ylabel="Doğru pozitif oranı")
+        ax.set_title(f"{display_name} ROC eğrisi")
+        ax.legend()
+        save(figure, "02_roc_curve")
+
+        figure, ax = plt.subplots(figsize=(7, 6))
+        for labels, probabilities, split_name in (
+            (validation_labels, validation_probabilities, "Validation"),
+            (test_labels, test_probabilities, "Test"),
+        ):
+            precision, recall, _ = precision_recall_curve(labels, probabilities)
+            score = average_precision_score(labels, probabilities)
+            ax.plot(recall, precision, linewidth=2, label=f"{split_name} (AP={score:.4f})")
+        ax.set(xlabel="Recall", ylabel="Precision", xlim=(0, 1), ylim=(0, 1.02))
+        ax.set_title(f"{display_name} precision-recall eğrisi")
+        ax.legend()
+        save(figure, "03_precision_recall_curve")
+
+        figure, axes = plt.subplots(1, 2, figsize=(13, 5))
+        bins = np.linspace(0.0, 1.0, 11)
+        bin_ids = np.minimum(np.digitize(test_probabilities, bins[1:-1]), 9)
+        predicted_means: list[float] = []
+        observed_means: list[float] = []
+        counts: list[int] = []
+        for bin_index in range(10):
+            mask = bin_ids == bin_index
+            if mask.any():
+                predicted_means.append(float(test_probabilities[mask].mean()))
+                observed_means.append(float(test_labels[mask].mean()))
+                counts.append(int(mask.sum()))
+        axes[0].plot([0, 1], [0, 1], "--", color="gray", label="İdeal")
+        axes[0].plot(predicted_means, observed_means, marker="o", label=display_name)
+        axes[0].set(
+            title="Kalibrasyon (güvenilirlik) eğrisi",
+            xlabel="Ortalama tahmin olasılığı",
+            ylabel="Gerçek saldırgan oranı",
+            xlim=(0, 1),
+            ylim=(0, 1),
+        )
+        axes[0].legend()
+        axes[1].bar(range(len(counts)), counts, color="#4c72b0")
+        axes[1].set_title("Kalibrasyon kutularındaki örnek sayısı")
+        axes[1].set_xlabel("Dolu olasılık kutusu")
+        axes[1].set_ylabel("Örnek")
+        save(figure, "04_calibration_curve")
+
+        figure, ax = plt.subplots(figsize=(9, 5))
+        probability_frame = pd.DataFrame(
+            {
+                "Saldırgan olasılığı": test_probabilities,
+                "Gerçek sınıf": np.where(test_labels == 1, "Saldırgan", "Temiz"),
+            }
+        )
+        sns.histplot(
+            data=probability_frame,
+            x="Saldırgan olasılığı",
+            hue="Gerçek sınıf",
+            bins=50,
+            stat="density",
+            common_norm=False,
+            element="step",
+            ax=ax,
+        )
+        ax.axvline(threshold, color="black", linestyle="--", label=f"Eşik={threshold:.3f}")
+        ax.set_title(f"{display_name} test olasılık dağılımı")
+        ax.legend()
+        save(figure, "05_probability_distribution")
+
+        threshold_grid = np.linspace(0.01, 0.99, 99)
+        precision_values: list[float] = []
+        recall_values: list[float] = []
+        f1_values: list[float] = []
+        fpr_values: list[float] = []
+        for candidate in threshold_grid:
+            candidate_predictions = (validation_probabilities >= candidate).astype(np.int8)
+            tn, fp, fn, tp = confusion_matrix(
+                validation_labels, candidate_predictions, labels=[0, 1]
+            ).ravel()
+            precision_values.append(
+                float(precision_score(validation_labels, candidate_predictions, zero_division=0))
+            )
+            recall_values.append(
+                float(recall_score(validation_labels, candidate_predictions, zero_division=0))
+            )
+            f1_values.append(
+                float(f1_score(validation_labels, candidate_predictions, zero_division=0))
+            )
+            fpr_values.append(float(fp / max(fp + tn, 1)))
+        figure, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(threshold_grid, precision_values, label="Precision")
+        ax.plot(threshold_grid, recall_values, label="Recall")
+        ax.plot(threshold_grid, f1_values, label="F1")
+        ax.plot(threshold_grid, fpr_values, label="FPR")
+        ax.axvline(threshold, color="black", linestyle="--", label=f"Seçilen eşik={threshold:.3f}")
+        ax.axhline(
+            self.config.target_false_positive_rate,
+            color="#c44e52",
+            linestyle=":",
+            label=f"Hedef FPR={self.config.target_false_positive_rate:.3f}",
+        )
+        ax.set(
+            title=f"{display_name} validation eşik analizi",
+            xlabel="Karar eşiği",
+            ylabel="Skor / oran",
+            xlim=(0, 1),
+            ylim=(0, 1.02),
+        )
+        ax.legend(ncol=2)
+        save(figure, "06_threshold_analysis")
+
+
+@dataclass(slots=True)
+class KerasTextResources:
+    vectorizer: Any
+    embedding_matrix: np.ndarray
+
+
+class KerasModelTrainer(BaseModelTrainer):
+    """Belgedeki Word2Vec, LSTM, CNN ve CNN->LSTM modellerini eğitir."""
+
+    def __init__(
+        self,
+        config: TrainingConfig,
+        data: TrainingDataModule,
+        model_name: str,
+        resource_cache: dict[str, KerasTextResources],
+    ) -> None:
+        super().__init__(config, data)
+        self.model_name = model_name
+        self.resource_cache = resource_cache
+
+    def _build_text_resources(self, tf: Any) -> KerasTextResources:
+        try:
+            from gensim.models import Word2Vec
+        except ImportError as exc:
+            raise RuntimeError(
+                "Belge (3) Word2Vec adımı için gensim kurun: pip install -e '.[training]'"
+            ) from exc
+
+        sentences = [
+            text.split()
+            for text in self.data.train["text"].astype(str)
+            if str(text).strip()
+        ]
+        print(f"Word2Vec yalnızca train üzerinde eğitiliyor: {len(sentences):,} metin")
+        word2vec = Word2Vec(
+            sentences=sentences,
+            vector_size=self.config.embedding_dim,
+            window=self.config.word2vec_window,
+            min_count=self.config.word2vec_min_count,
+            workers=1,
+            sg=1,
+            negative=10,
+            epochs=self.config.word2vec_epochs,
+            seed=self.config.seed,
+            hashfxn=stable_token_hash,
+            max_final_vocab=max(self.config.max_tokens - 2, 100),
+        )
+        vocabulary = word2vec.wv.index_to_key[: self.config.max_tokens - 2]
+        vectorizer = tf.keras.layers.TextVectorization(
+            vocabulary=vocabulary,
+            output_mode="int",
+            output_sequence_length=self.config.sequence_length,
+            standardize=None,
+            split="whitespace",
+            name="train_only_word2vec_vectorizer",
+        )
+        keras_vocabulary = vectorizer.get_vocabulary()
+        embedding_matrix = np.zeros(
+            (len(keras_vocabulary), self.config.embedding_dim), dtype=np.float32
+        )
+        if vocabulary:
+            embedding_matrix[1] = np.mean(
+                word2vec.wv.vectors[: len(vocabulary)], axis=0
+            )
+        for index, token in enumerate(keras_vocabulary[2:], start=2):
+            embedding_matrix[index] = word2vec.wv[token]
+
+        metadata = {
+            "method": "Word2Vec skip-gram",
+            "trained_on": "train_only",
+            "vocabulary_size": len(keras_vocabulary),
+            "vector_size": self.config.embedding_dim,
+            "window": self.config.word2vec_window,
+            "min_count": self.config.word2vec_min_count,
+            "epochs": self.config.word2vec_epochs,
+            "workers": 1,
+            "seed": self.config.seed,
+        }
+        (self.config.result_dir / "word2vec_config.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        del word2vec
+        gc.collect()
+        return KerasTextResources(vectorizer, embedding_matrix)
+
+    def _resources(self, tf: Any) -> KerasTextResources:
+        if "document_word2vec" not in self.resource_cache:
+            self.resource_cache["document_word2vec"] = self._build_text_resources(tf)
+        return self.resource_cache["document_word2vec"]
+
+    def _build_model(self, tf: Any, resources: KerasTextResources) -> Any:
+        layers = tf.keras.layers
+        regularizers = tf.keras.regularizers
+        config = self.config
+
+        @tf.keras.utils.register_keras_serializable(package="TurkishToxic")
+        class TokenDropout(layers.Layer):
+            def __init__(self, rate: float, **kwargs: Any) -> None:
+                super().__init__(**kwargs)
+                self.rate = rate
+
+            def call(self, inputs: Any, training: bool | None = None) -> Any:
+                if self.rate <= 0 or training is None:
+                    return inputs
+
+                def apply_dropout() -> Any:
+                    random_values = tf.random.uniform(tf.shape(inputs))
+                    drop_mask = tf.logical_and(random_values < self.rate, inputs > 1)
+                    return tf.where(drop_mask, tf.zeros_like(inputs), inputs)
+
+                if isinstance(training, bool):
+                    return apply_dropout() if training else inputs
+                return tf.cond(tf.cast(training, tf.bool), apply_dropout, lambda: inputs)
+
+            def get_config(self) -> dict[str, Any]:
+                return {**super().get_config(), "rate": self.rate}
+
+        text_input = layers.Input(shape=(), dtype=tf.string, name="text")
+        token_ids = resources.vectorizer(text_input)
+        token_ids = TokenDropout(config.token_dropout, name="token_dropout")(token_ids)
+        embedding = layers.Embedding(
+            input_dim=resources.embedding_matrix.shape[0],
+            output_dim=config.embedding_dim,
+            weights=[resources.embedding_matrix],
+            trainable=False,
+            mask_zero=False,
+            name="train_only_word2vec_embedding",
+        )(token_ids)
+        x = layers.SpatialDropout1D(config.dropout * 0.65)(embedding)
+        regularizer = regularizers.l2(config.l2_regularization)
+
+        if self.model_name == "lstm":
+            x = layers.LSTM(
+                config.recurrent_units,
+                return_sequences=True,
+                dropout=config.dropout * 0.45,
+                recurrent_dropout=0.0,
+                kernel_regularizer=regularizer,
+                recurrent_regularizer=regularizer,
+                name="lstm_encoder",
+            )(x)
+            x = layers.Concatenate()(
+                [layers.GlobalMaxPooling1D()(x), layers.GlobalAveragePooling1D()(x)]
+            )
+        elif self.model_name == "cnn":
+            branches = []
+            for kernel_size in (2, 3, 4, 5):
+                branch = layers.Conv1D(
+                    config.cnn_filters,
+                    kernel_size,
+                    padding="same",
+                    activation="swish",
+                    kernel_regularizer=regularizer,
+                )(x)
+                branch = layers.GlobalMaxPooling1D()(branch)
+                branches.append(branch)
+            x = layers.Concatenate(name="multi_kernel_features")(branches)
+        else:  # Belge (3)'te önerilen CNN -> RNN/LSTM hibrit modeli.
+            x = layers.Conv1D(
+                config.cnn_filters,
+                kernel_size=3,
+                padding="same",
+                activation="relu",
+                kernel_regularizer=regularizer,
+                name="local_ngram_cnn",
+            )(x)
+            x = layers.MaxPooling1D(pool_size=2, name="cnn_max_pooling")(x)
+            x = layers.LSTM(
+                config.recurrent_units,
+                return_sequences=True,
+                dropout=config.dropout * 0.45,
+                recurrent_dropout=0.0,
+                kernel_regularizer=regularizer,
+                recurrent_regularizer=regularizer,
+                name="long_term_lstm",
+            )(x)
+            x = layers.Concatenate(name="hybrid_features")(
+                [layers.GlobalMaxPooling1D()(x), layers.GlobalAveragePooling1D()(x)]
+            )
+
+        x = layers.Dense(128, activation="swish", kernel_regularizer=regularizer)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(config.dropout)(x)
+        output = layers.Dense(1, activation="sigmoid", dtype="float32", name="toxicity")(x)
+        model = tf.keras.Model(text_input, output, name=f"turkish_toxic_{self.model_name}")
+        optimizer = tf.keras.optimizers.AdamW(
+            learning_rate=config.keras_learning_rate,
+            weight_decay=config.l2_regularization,
+            global_clipnorm=1.0,
+        )
+        model.compile(
+            optimizer=optimizer,
+            loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=config.label_smoothing),
+            metrics=[
+                tf.keras.metrics.BinaryAccuracy(name="accuracy"),
+                tf.keras.metrics.Precision(name="precision"),
+                tf.keras.metrics.Recall(name="recall"),
+                tf.keras.metrics.AUC(name="roc_auc"),
+                tf.keras.metrics.AUC(name="pr_auc", curve="PR"),
+            ],
+        )
+        return model
+
+    @staticmethod
+    def _dataset(tf: Any, frame: pd.DataFrame, batch_size: int, training: bool, seed: int) -> Any:
+        dataset = tf.data.Dataset.from_tensor_slices(
+            (frame["text"].astype(str).to_numpy(), frame["label"].astype("float32").to_numpy())
+        )
+        if training:
+            dataset = dataset.shuffle(min(len(frame), 50_000), seed=seed, reshuffle_each_iteration=True)
+        return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    def _save_history(self, history: Any) -> None:
+        values = {
+            key: [float(value) for value in series]
+            for key, series in history.history.items()
+        }
+        (self.config.result_dir / f"{self.model_name}_history.json").write_text(
+            json.dumps(values, indent=2), encoding="utf-8"
+        )
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        plot_dir = self.config.result_dir / "grafikler"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        figure, axes = plt.subplots(2, 3, figsize=(16, 9))
+        metric_titles = (
+            ("loss", "Kayıp"),
+            ("accuracy", "Doğruluk"),
+            ("precision", "Precision"),
+            ("recall", "Recall"),
+            ("roc_auc", "ROC-AUC"),
+            ("pr_auc", "PR-AUC"),
+        )
+        for axis, (metric, title) in zip(axes.flat, metric_titles):
+            axis.plot(values.get(metric, []), marker="o", markersize=3, label="Train")
+            axis.plot(
+                values.get(f"val_{metric}", []),
+                marker="o",
+                markersize=3,
+                label="Validation",
+            )
+            axis.set_title(f"{self.model_name.upper()} {title}")
+            axis.set_xlabel("Epoch")
+            axis.legend()
+            axis.grid(alpha=0.25)
+        figure.tight_layout()
+        figure.savefig(
+            plot_dir / f"{self.model_name}_00_egitim_gecmisi.png",
+            dpi=170,
+            bbox_inches="tight",
+        )
+        plt.close(figure)
+
+    def train(self) -> PredictionBundle:
+        try:
+            import tensorflow as tf
+        except ImportError as exc:
+            raise RuntimeError("Keras modelleri için TensorFlow kurun: pip install -e '.[training]'") from exc
+
+        gpus = tf.config.list_physical_devices("GPU")
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError:
+                pass
+        if gpus:
+            tf.keras.mixed_precision.set_global_policy("mixed_float16")
+        tf.keras.utils.set_random_seed(self.config.seed)
+        try:
+            tf.config.experimental.enable_op_determinism()
+        except (AttributeError, RuntimeError):
+            pass
+
+        resources = self._resources(tf)
+        model = self._build_model(tf, resources)
+        model.summary()
+
+        artifact = self.config.model_dir / f"{self.model_name}_best.keras"
+        callbacks = [
+            tf.keras.callbacks.ModelCheckpoint(
+                artifact, monitor="val_loss", mode="min", save_best_only=True, verbose=1
+            ),
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                mode="min",
+                patience=self.config.keras_patience,
+                min_delta=1e-4,
+                restore_best_weights=True,
+                verbose=1,
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6, verbose=1
+            ),
+            tf.keras.callbacks.TerminateOnNaN(),
+        ]
+        history = model.fit(
+            self._dataset(tf, self.data.train, self.config.keras_batch_size, True, self.config.seed),
+            validation_data=self._dataset(
+                tf, self.data.valid, self.config.keras_batch_size, False, self.config.seed
+            ),
+            epochs=self.config.keras_epochs,
+            callbacks=callbacks,
+            class_weight=self.data.class_weights(),
+            verbose=2,
+        )
+        self._save_history(history)
+        validation_probs = model.predict(
+            self._dataset(tf, self.data.valid, self.config.keras_batch_size, False, self.config.seed),
+            verbose=0,
+        ).reshape(-1)
+        test_probs = model.predict(
+            self._dataset(tf, self.data.test, self.config.keras_batch_size, False, self.config.seed),
+            verbose=0,
+        ).reshape(-1)
+        bundle = self._calibrate_and_evaluate(
+            self.model_name, validation_probs, test_probs, artifact
+        )
+        tf.keras.backend.clear_session()
+        gc.collect()
+        return bundle
+
+
+class FocalLossTrainer(_TrainerBase):
+    """HuggingFace Trainer üzerinde class-weighted focal loss."""
+
+    def __init__(
+        self,
+        *args: Any,
+        focal_gamma: float = 2.0,
+        class_weights: Sequence[float] = (1.0, 1.0),
+        label_smoothing: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.focal_gamma = float(focal_gamma)
+        self.focal_class_weights = tuple(float(value) for value in class_weights)
+        self.focal_label_smoothing = float(label_smoothing)
+
+    def compute_loss(
+        self,
+        model: Any,
+        inputs: dict[str, Any],
+        return_outputs: bool = False,
+        num_items_in_batch: Any = None,
+    ) -> Any:
+        import torch
+        import torch.nn.functional as functional
+
+        model_inputs = dict(inputs)
+        labels = model_inputs.pop("labels")
+        outputs = model(**model_inputs)
+        logits = outputs.logits
+        weights = torch.as_tensor(
+            self.focal_class_weights, dtype=logits.dtype, device=logits.device
+        )
+        cross_entropy = functional.cross_entropy(
+            logits,
+            labels,
+            weight=weights,
+            reduction="none",
+            label_smoothing=self.focal_label_smoothing,
+        )
+        true_class_probability = torch.softmax(logits.float(), dim=-1).gather(
+            1, labels.unsqueeze(1)
+        ).squeeze(1)
+        loss = ((1 - true_class_probability) ** self.focal_gamma * cross_entropy).mean()
+        return (loss, outputs) if return_outputs else loss
+
+
+class TransformerModelTrainer(BaseModelTrainer):
+    class TextDataset:
+        def __init__(self, encodings: dict[str, Any], labels: np.ndarray) -> None:
+            self.encodings = encodings
+            self.labels = labels.astype(np.int64)
+
+        def __len__(self) -> int:
+            return len(self.labels)
+
+        def __getitem__(self, index: int) -> dict[str, Any]:
+            import torch
+
+            item = {key: torch.tensor(value[index]) for key, value in self.encodings.items()}
+            item["labels"] = torch.tensor(self.labels[index], dtype=torch.long)
+            return item
+
+    def _tokenize(self, tokenizer: Any, frame: pd.DataFrame) -> "TransformerModelTrainer.TextDataset":
+        encodings = tokenizer(
+            frame["text"].astype(str).tolist(),
+            truncation=True,
+            max_length=self.config.transformer_max_length,
+            padding=False,
+        )
+        return self.TextDataset(encodings, frame["label"].to_numpy())
+
+    @staticmethod
+    def _trainer_metrics(evaluation: Any) -> dict[str, float]:
+        logits, labels = evaluation
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        logits = np.asarray(logits)
+        logits = logits - logits.max(axis=1, keepdims=True)
+        probabilities = np.exp(logits)[:, 1] / np.exp(logits).sum(axis=1)
+        return calculate_metrics(np.asarray(labels), probabilities, 0.5)
+
+    @staticmethod
+    def _probabilities(prediction_output: Any) -> np.ndarray:
+        logits = prediction_output.predictions
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        logits = np.asarray(logits, dtype=np.float64)
+        logits -= logits.max(axis=1, keepdims=True)
+        exponentials = np.exp(logits)
+        return exponentials[:, 1] / exponentials.sum(axis=1)
+
+    def _save_trainer_history(self, trainer: Any) -> None:
+        rows = list(trainer.state.log_history)
+        if not rows:
+            return
+        history_frame = pd.DataFrame(rows)
+        history_frame.to_csv(
+            self.config.result_dir / "bert_history.csv", index=False, encoding="utf-8"
+        )
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        plot_dir = self.config.result_dir / "grafikler"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        figure, axes = plt.subplots(2, 2, figsize=(14, 9))
+
+        train_rows = history_frame.dropna(subset=["loss"]) if "loss" in history_frame else pd.DataFrame()
+        eval_rows = (
+            history_frame.dropna(subset=["eval_loss"])
+            if "eval_loss" in history_frame
+            else pd.DataFrame()
+        )
+        if not train_rows.empty:
+            axes[0, 0].plot(train_rows["step"], train_rows["loss"], label="Train")
+        if not eval_rows.empty:
+            axes[0, 0].plot(eval_rows["step"], eval_rows["eval_loss"], marker="o", label="Validation")
+        axes[0, 0].set_title("BERT kayıp")
+        axes[0, 0].set_xlabel("Adım")
+        axes[0, 0].legend()
+
+        for metric, label in (("eval_accuracy", "Doğruluk"), ("eval_f1", "F1")):
+            if metric in history_frame:
+                metric_rows = history_frame.dropna(subset=[metric])
+                axes[0, 1].plot(metric_rows["step"], metric_rows[metric], marker="o", label=label)
+        axes[0, 1].set_title("BERT validation sınıflandırma metrikleri")
+        axes[0, 1].set_xlabel("Adım")
+        axes[0, 1].legend()
+
+        for metric, label in (("eval_roc_auc", "ROC-AUC"), ("eval_pr_auc", "PR-AUC")):
+            if metric in history_frame:
+                metric_rows = history_frame.dropna(subset=[metric])
+                axes[1, 0].plot(metric_rows["step"], metric_rows[metric], marker="o", label=label)
+        axes[1, 0].set_title("BERT validation alan metrikleri")
+        axes[1, 0].set_xlabel("Adım")
+        axes[1, 0].legend()
+
+        if "learning_rate" in history_frame:
+            learning_rows = history_frame.dropna(subset=["learning_rate"])
+            axes[1, 1].plot(learning_rows["step"], learning_rows["learning_rate"])
+        axes[1, 1].set_title("BERT öğrenme oranı")
+        axes[1, 1].set_xlabel("Adım")
+        for axis in axes.flat:
+            axis.grid(alpha=0.25)
+        figure.tight_layout()
+        figure.savefig(
+            plot_dir / "bert_00_egitim_gecmisi.png", dpi=170, bbox_inches="tight"
+        )
+        plt.close(figure)
+
+    def train(self) -> PredictionBundle:
+        try:
+            import torch
+            from transformers import (
+                AutoConfig,
+                AutoModelForSequenceClassification,
+                AutoTokenizer,
+                DataCollatorWithPadding,
+                EarlyStoppingCallback,
+                TrainingArguments,
+            )
+            from transformers.trainer_utils import get_last_checkpoint
+        except ImportError as exc:
+            raise RuntimeError("BERT için torch ve transformers kurun: pip install -e '.[ml]'") from exc
+
+        tokenizer = AutoTokenizer.from_pretrained(self.config.transformer_model, use_fast=True)
+        model_config = AutoConfig.from_pretrained(
+            self.config.transformer_model,
+            num_labels=2,
+            id2label={0: "clean", 1: "toxic"},
+            label2id={"clean": 0, "toxic": 1},
+        )
+        for attribute in ("hidden_dropout_prob", "attention_probs_dropout_prob", "classifier_dropout"):
+            if hasattr(model_config, attribute):
+                setattr(model_config, attribute, min(self.config.dropout * 0.5, 0.30))
+        model = AutoModelForSequenceClassification.from_pretrained(
+            self.config.transformer_model, config=model_config
+        )
+        if self.config.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+            model.config.use_cache = False
+
+        train_dataset = self._tokenize(tokenizer, self.data.train)
+        valid_dataset = self._tokenize(tokenizer, self.data.valid)
+        test_dataset = self._tokenize(tokenizer, self.data.test)
+        cuda = torch.cuda.is_available()
+        bf16 = bool(cuda and torch.cuda.is_bf16_supported())
+        tf32 = bool(cuda and torch.cuda.get_device_capability()[0] >= 8)
+        if cuda:
+            print(f"GPU: {torch.cuda.get_device_name(0)} | bf16={bf16} | tf32={tf32}")
+        else:
+            print("UYARI: CUDA GPU bulunamadi; BERT egitimi CPU'da cok uzun surebilir.")
+        compile_enabled = bool(
+            self.config.torch_compile
+            and cuda
+            and platform.system().lower() != "windows"
+            and hasattr(torch, "compile")
+        )
+        if self.config.torch_compile and not compile_enabled:
+            print("torch.compile bu ortamda güvenli/destekli değil; eager moda geçildi.")
+
+        run_dir = self.config.model_dir / "bert_checkpoints"
+        steps_per_epoch = math.ceil(
+            len(self.data.train)
+            / (self.config.transformer_batch_size * self.config.transformer_gradient_accumulation)
+        )
+        arguments = TrainingArguments(
+            output_dir=str(run_dir),
+            num_train_epochs=self.config.transformer_epochs,
+            per_device_train_batch_size=self.config.transformer_batch_size,
+            per_device_eval_batch_size=self.config.transformer_eval_batch_size,
+            gradient_accumulation_steps=self.config.transformer_gradient_accumulation,
+            learning_rate=self.config.transformer_learning_rate,
+            weight_decay=self.config.transformer_weight_decay,
+            warmup_ratio=self.config.transformer_warmup_ratio,
+            lr_scheduler_type="cosine",
+            max_grad_norm=1.0,
+            eval_strategy="epoch",
+            save_strategy="epoch",
+            logging_strategy="steps",
+            logging_steps=max(10, steps_per_epoch // 10),
+            load_best_model_at_end=True,
+            metric_for_best_model="f1",
+            greater_is_better=True,
+            save_total_limit=2,
+            fp16=cuda and not bf16,
+            bf16=bf16,
+            tf32=tf32,
+            torch_compile=compile_enabled,
+            optim="adamw_torch_fused" if cuda else "adamw_torch",
+            dataloader_num_workers=0,
+            dataloader_pin_memory=cuda,
+            report_to=[],
+            seed=self.config.seed,
+            data_seed=self.config.seed,
+        )
+        weights = self.data.class_weights()
+        trainer = FocalLossTrainer(
+            model=model,
+            args=arguments,
+            train_dataset=train_dataset,
+            eval_dataset=valid_dataset,
+            data_collator=DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8 if cuda else None),
+            compute_metrics=self._trainer_metrics,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=self.config.transformer_patience)],
+            focal_gamma=self.config.focal_gamma,
+            class_weights=(weights[0], weights[1]),
+            label_smoothing=self.config.label_smoothing,
+        )
+        resume_checkpoint: str | None = None
+        if self.config.resume_from_checkpoint == "auto":
+            resume_checkpoint = get_last_checkpoint(str(run_dir)) if run_dir.exists() else None
+            if resume_checkpoint:
+                print(f"Checkpoint'ten devam ediliyor: {resume_checkpoint}")
+            else:
+                print("Devam edilecek checkpoint bulunamadi; egitim bastan basliyor.")
+        elif self.config.resume_from_checkpoint is not None:
+            checkpoint_path = Path(self.config.resume_from_checkpoint)
+            if not checkpoint_path.exists():
+                raise FileNotFoundError(f"Checkpoint bulunamadi: {checkpoint_path}")
+            resume_checkpoint = str(checkpoint_path)
+            print(f"Checkpoint'ten devam ediliyor: {resume_checkpoint}")
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
+        self._save_trainer_history(trainer)
+
+        hf_dir = self.config.model_dir / "bert_best_model"
+        trainer.save_model(str(hf_dir))
+        tokenizer.save_pretrained(hf_dir)
+        state_path = self.config.model_dir / "bert_best.pt"
+        state_dict = {
+            key.removeprefix("_orig_mod.").removeprefix("module."): value.detach().cpu()
+            for key, value in trainer.model.state_dict().items()
+        }
+        torch.save(state_dict, state_path)
+
+        validation_probs = self._probabilities(trainer.predict(valid_dataset))
+        test_probs = self._probabilities(trainer.predict(test_dataset))
+        bundle = self._calibrate_and_evaluate("bert", validation_probs, test_probs, hf_dir)
+        self._write_manifest(bundle, hf_dir, state_path)
+        del trainer, model
+        if cuda:
+            torch.cuda.empty_cache()
+        gc.collect()
+        return bundle
+
+    def _write_manifest(self, bundle: PredictionBundle, hf_dir: Path, state_path: Path) -> None:
+        data_version = self.data.dataset_manifest.get("data_version", "unknown")
+        manifest = {
+            "model_version": f"bert-tr-v3-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+            "preprocessing_version": PREPROCESSING_VERSION,
+            "threshold": round(float(np.clip(bundle.threshold, 0.5, 0.999)), 6),
+            "temperature": round(bundle.temperature, 6),
+            "label_mapping": {"0": "clean", "1": "toxic"},
+            "training_data_version": data_version,
+            "base_model": self.config.transformer_model,
+            "max_length": self.config.transformer_max_length,
+            "target_false_positive_rate": self.config.target_false_positive_rate,
+            "validation_metrics": bundle.validation_metrics,
+            "artifacts": {
+                "bert_best.pt": file_sha256(state_path),
+                "bert_best_model": directory_sha256(hf_dir),
+            },
+            "tokenizer_path": "bert_best_model",
+        }
+        manifest_path = self.config.model_dir / "model_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        if self.config.deploy_backend:
+            if PREPROCESSING_VERSION != BACKEND_PREPROCESSING_VERSION:
+                raise RuntimeError(
+                    "Belge (3) ön işlemesi backend tarafından henüz uygulanmıyor; "
+                    "uyumsuz modeli otomatik dağıtmak güvenli değil."
+                )
+            backend_dir = self.config.project_dir / "backend_api"
+            shutil.copy2(state_path, backend_dir / state_path.name)
+            shutil.copy2(manifest_path, backend_dir / manifest_path.name)
+            shutil.copytree(hf_dir, backend_dir / hf_dir.name, dirs_exist_ok=True)
+
+
+class TrainingPipeline:
+    def __init__(self, config: TrainingConfig) -> None:
+        self.config = config
+        self.data = TrainingDataModule(config)
+        self.keras_resource_cache: dict[str, KerasTextResources] = {}
+
+    def dry_run(self) -> dict[str, Any]:
+        self.data.load()
         return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'label': torch.tensor(self.labels[idx], dtype=torch.long)
+            "status": "ready",
+            "models": list(self.config.models),
+            "rows": {name: len(frame) for name, frame in self.data.frames.items()},
+            "class_weights": self.data.class_weights(),
+            "data_version": self.data.dataset_manifest.get("data_version"),
         }
 
-# Augmented veri ile eğit
-train_dataset = ToxicDataset(df_train_aug['text'].values, df_train_aug['label'].values, bert_tokenizer, BERT_MAX_LEN)
-valid_dataset = ToxicDataset(df_valid['text'].values, df_valid['label'].values, bert_tokenizer, BERT_MAX_LEN)
-test_dataset  = ToxicDataset(df_test['text'].values, df_test['label'].values, bert_tokenizer, BERT_MAX_LEN)
-
-train_loader = DataLoader(train_dataset, batch_size=BERT_BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
-valid_loader = DataLoader(valid_dataset, batch_size=BERT_BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
-test_loader  = DataLoader(test_dataset,  batch_size=BERT_BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
-
-print(f"   Train batches: {len(train_loader)} | Valid: {len(valid_loader)} | Test: {len(test_loader)}")
-
-# Model
-bert_model = BertForSequenceClassification.from_pretrained(
-    BERT_MODEL_NAME, num_labels=2,
-    hidden_dropout_prob=0.2,       # BERT içi dropout
-    attention_probs_dropout_prob=0.2  # Attention dropout
-)
-bert_model.to(device)
-print("✅ BERT modeli yüklendi!")
-
-# Discriminative Learning Rates (alt katmanlara düşük lr, üst katmanlara yüksek lr)
-no_decay = ['bias', 'LayerNorm.weight']
-optimizer_grouped_parameters = [
-    # BERT alt katmanları (düşük lr)
-    {'params': [p for n, p in bert_model.bert.embeddings.named_parameters()],
-     'lr': BERT_LR * 0.1, 'weight_decay': 0.01},
-    # BERT encoder katmanları
-    {'params': [p for n, p in bert_model.bert.encoder.named_parameters()
-                if not any(nd in n for nd in no_decay)],
-     'lr': BERT_LR, 'weight_decay': 0.01},
-    {'params': [p for n, p in bert_model.bert.encoder.named_parameters()
-                if any(nd in n for nd in no_decay)],
-     'lr': BERT_LR, 'weight_decay': 0.0},
-    # Classifier katmanı (yüksek lr)
-    {'params': bert_model.classifier.parameters(),
-     'lr': BERT_LR * 5, 'weight_decay': 0.01},
-]
-
-optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
-total_steps = len(train_loader) * BERT_EPOCHS
-scheduler = get_linear_schedule_with_warmup(
-    optimizer,
-    num_warmup_steps=int(BERT_WARMUP * total_steps),
-    num_training_steps=total_steps
-)
-
-# Class weights for loss
-weights_tensor = torch.tensor([class_weights[0], class_weights[1]], dtype=torch.float).to(device)
-criterion = torch.nn.CrossEntropyLoss(weight=weights_tensor, label_smoothing=LABEL_SMOOTH)
-
-# Mixed precision scaler
-scaler = GradScaler()
-
-# Eğitim
-train_losses, val_losses, train_accs, val_accs = [], [], [], []
-best_val_f1 = 0  # F1'e göre kaydet (accuracy yerine)
-
-basla = datetime.now()
-
-for epoch in range(BERT_EPOCHS):
-    print(f"\n{'─'*60}")
-    print(f"   Epoch {epoch+1}/{BERT_EPOCHS}")
-    print(f"{'─'*60}")
-
-    # === Training ===
-    bert_model.train()
-    total_loss, correct, total = 0, 0, 0
-
-    for batch_idx, batch in enumerate(train_loader):
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['label'].to(device)
-
-        optimizer.zero_grad()
-
-        # Mixed Precision Forward
-        with autocast():
-            outputs = bert_model(input_ids, attention_mask=attention_mask)
-            loss = criterion(outputs.logits, labels)
-
-        # Scaled backward
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(bert_model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
-
-        total_loss += loss.item()
-        preds = torch.argmax(outputs.logits, dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-
-        if (batch_idx + 1) % 50 == 0:
-            print(f"     Batch {batch_idx+1}/{len(train_loader)} | Loss: {loss.item():.4f} | Acc: {correct/total:.4f}")
-
-    train_loss = total_loss / len(train_loader)
-    train_acc = correct / total
-    train_losses.append(train_loss); train_accs.append(train_acc)
-
-    # === Validation ===
-    bert_model.eval()
-    total_loss, correct, total = 0, 0, 0
-    val_preds_epoch, val_labels_epoch = [], []
-
-    with torch.no_grad():
-        for batch in valid_loader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['label'].to(device)
-
-            with autocast():
-                outputs = bert_model(input_ids, attention_mask=attention_mask)
-                loss = criterion(outputs.logits, labels)
-
-            total_loss += loss.item()
-            preds = torch.argmax(outputs.logits, dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-            val_preds_epoch.extend(preds.cpu().numpy())
-            val_labels_epoch.extend(labels.cpu().numpy())
-
-    val_loss = total_loss / len(valid_loader)
-    val_acc = correct / total
-    val_losses.append(val_loss); val_accs.append(val_acc)
-
-    from sklearn.metrics import f1_score as f1_metric
-    val_f1 = f1_metric(val_labels_epoch, val_preds_epoch)
-
-    print(f"\n   📈 Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-    print(f"   📉 Val   Loss: {val_loss:.4f} | Val   Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}")
-
-    # En iyi modeli F1-Score'a göre kaydet
-    if val_f1 > best_val_f1:
-        best_val_f1 = val_f1
-        torch.save(bert_model.state_dict(), os.path.join(MODEL_KLASORU, 'bert_best.pt'))
-
-        # Ek olarak modeli tam HuggingFace formatında kaydet
-        bert_model.save_pretrained(os.path.join(MODEL_KLASORU, 'bert_best_model'))
-        bert_tokenizer.save_pretrained(os.path.join(MODEL_KLASORU, 'bert_best_model'))
-
-        print(f"   ✅ En iyi model kaydedildi! (val_f1: {val_f1:.4f})")
-
-bert_sure = datetime.now() - basla
-print(f"\n⏱️ BERT eğitim süresi: {bert_sure}")
-
-# BERT Eğitim Grafiği
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-epochs_range = range(1, BERT_EPOCHS + 1)
-
-axes[0].plot(epochs_range, train_accs, 'o-', label='Train', color='#3498db', lw=2)
-axes[0].plot(epochs_range, val_accs, 'o-', label='Val', color='#e74c3c', lw=2)
-axes[0].set_title('BERT - Accuracy', fontsize=14, fontweight='bold')
-axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Accuracy')
-axes[0].legend(); axes[0].grid(True, alpha=0.3)
-
-axes[1].plot(epochs_range, train_losses, 'o-', label='Train', color='#3498db', lw=2)
-axes[1].plot(epochs_range, val_losses, 'o-', label='Val', color='#e74c3c', lw=2)
-axes[1].set_title('BERT - Loss', fontsize=14, fontweight='bold')
-axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('Loss')
-axes[1].legend(); axes[1].grid(True, alpha=0.3)
-
-gap = [t - v for t, v in zip(train_accs, val_accs)]
-axes[2].plot(epochs_range, gap, 'o-', color='#e67e22', lw=2)
-axes[2].axhline(y=0, color='green', linestyle='--', alpha=0.5)
-axes[2].fill_between(epochs_range, gap, alpha=0.3, color='#e67e22')
-axes[2].set_title('BERT - Overfitting Gap', fontsize=14, fontweight='bold')
-axes[2].set_xlabel('Epoch'); axes[2].set_ylabel('Train-Val Acc Gap')
-axes[2].grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.savefig(os.path.join(SONUC_KLASORU, 'BERT_egitim.png'), dpi=150, bbox_inches='tight')
-plt.show()
-
-# BERT Test
-print("\n🧪 BERT test değerlendirmesi...")
-bert_model.load_state_dict(torch.load(os.path.join(MODEL_KLASORU, 'bert_best.pt')))
-bert_model.eval()
-
-
-def collect_toxicity_probabilities(loader):
-    """Return label-1 probabilities and labels without changing model state."""
-    probabilities, labels_all = [], []
-    with torch.no_grad():
-        for batch in loader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['label'].to(device)
-            with autocast():
-                outputs = bert_model(input_ids, attention_mask=attention_mask)
-            probs = torch.softmax(outputs.logits.float(), dim=1)[:, 1]
-            probabilities.extend(probs.cpu().numpy())
-            labels_all.extend(labels.cpu().numpy())
-    return np.asarray(probabilities), np.asarray(labels_all)
-
-
-def select_threshold_for_low_fpr(probabilities, labels, target_fpr):
-    """Pick the lowest threshold that satisfies the validation FPR budget."""
-    candidates = []
-    negative_count = max(int((labels == 0).sum()), 1)
-
-    for threshold in np.arange(0.50, 1.0001, 0.005):
-        predictions = probabilities >= threshold
-        false_positives = int(((predictions == 1) & (labels == 0)).sum())
-        false_negatives = int(((predictions == 0) & (labels == 1)).sum())
-        false_positive_rate = false_positives / negative_count
-        if false_positive_rate <= target_fpr:
-            candidates.append((float(threshold), false_positives, false_negatives, false_positive_rate))
-
-    # Never silently lower the threshold when the validation target cannot be
-    # met. A conservative fallback protects normal users until labels/model
-    # quality can be improved.
-    return min(candidates, key=lambda candidate: candidate[0]) if candidates else (0.999, 0, 0, 1.0)
-
-
-validation_probs, validation_labels = collect_toxicity_probabilities(valid_loader)
-toxicity_threshold, val_fp, val_fn, val_fpr = select_threshold_for_low_fpr(
-    validation_probs, validation_labels, TARGET_FPR
-)
-threshold_config = {
-    "threshold": round(toxicity_threshold, 4),
-    "target_false_positive_rate": TARGET_FPR,
-    "validation_false_positive_rate": round(val_fpr, 6),
-    "validation_false_positives": val_fp,
-    "validation_false_negatives": val_fn,
-    "selection": "lowest_threshold_meeting_validation_fpr",
-}
-threshold_path = os.path.join(MODEL_KLASORU, "toxicity_threshold.json")
-with open(threshold_path, "w", encoding="utf-8") as threshold_file:
-    json.dump(threshold_config, threshold_file, ensure_ascii=False, indent=2)
-
-print(f"   Calibrated threshold: {toxicity_threshold:.3f} | validation FPR: {val_fpr:.2%}")
-print(f"   Threshold config saved: {threshold_path}")
-
-model_path = os.path.join(MODEL_KLASORU, "bert_best.pt")
-sha256 = hashlib.sha256()
-with open(model_path, "rb") as model_file:
-    for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
-        sha256.update(chunk)
-
-hf_directory_hash = hashlib.sha256()
-hf_directory = os.path.join(MODEL_KLASORU, "bert_best_model")
-artifact_paths = []
-for root, _, files in os.walk(hf_directory):
-    artifact_paths.extend(os.path.join(root, filename) for filename in files)
-for path in sorted(artifact_paths):
-    relative_path = os.path.relpath(path, hf_directory).replace(os.sep, "/")
-    file_hash = hashlib.sha256()
-    with open(path, "rb") as artifact_file:
-        for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
-            file_hash.update(chunk)
-    hf_directory_hash.update(relative_path.encode("utf-8"))
-    hf_directory_hash.update(file_hash.digest())
-
-model_manifest = {
-    "model_version": f"bert-tr-v2-{datetime.utcnow().strftime('%Y%m%d')}",
-    "preprocessing_version": PREPROCESSING_VERSION,
-    "threshold": round(toxicity_threshold, 4),
-    "label_mapping": {"0": "clean", "1": "toxic"},
-    "training_data_version": "combined-tr-v2",
-    "validation_false_positive_rate": round(val_fpr, 6),
-    "validation_false_positives": val_fp,
-    "validation_false_negatives": val_fn,
-    "artifacts": {
-        "bert_best.pt": sha256.hexdigest(),
-        "bert_best_model": hf_directory_hash.hexdigest(),
-    },
-    "tokenizer_path": "bert_best_model",
-}
-manifest_path = os.path.join(MODEL_KLASORU, "model_manifest.json")
-with open(manifest_path, "w", encoding="utf-8") as manifest_file:
-    json.dump(model_manifest, manifest_file, ensure_ascii=False, indent=2)
-
-# The API loads artefacts from backend_api. Deploy the complete HuggingFace
-# folder as well as the calibrated threshold so that runtime never falls back
-# to an unrelated tokenizer/model or a stale threshold.
-backend_model_dir = os.path.join(PROJE_KLASORU, "backend_api")
-if os.path.isdir(backend_model_dir):
-    shutil.copy2(os.path.join(MODEL_KLASORU, "bert_best.pt"), backend_model_dir)
-    shutil.copy2(threshold_path, backend_model_dir)
-    shutil.copy2(manifest_path, backend_model_dir)
-    shutil.copytree(
-        os.path.join(MODEL_KLASORU, "bert_best_model"),
-        os.path.join(backend_model_dir, "bert_best_model"),
-        dirs_exist_ok=True,
-    )
-    print(f"   API model artefacts deployed: {backend_model_dir}")
-
-all_preds, all_labels, all_probs = [], [], []
-with torch.no_grad():
-    for batch in test_loader:
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['label'].to(device)
-        with autocast():
-            outputs = bert_model(input_ids, attention_mask=attention_mask)
-        probs = torch.softmax(outputs.logits.float(), dim=1)[:, 1]
-        preds = torch.argmax(outputs.logits, dim=1)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        all_probs.extend(probs.cpu().numpy())
-
-calibrated_preds = (np.array(all_probs) >= toxicity_threshold).astype(int)
-bert_sonuc = performans_raporu_ciz(
-    np.array(all_labels), calibrated_preds, np.array(all_probs), 'BERT_Calibrated'
-)
-
-
-# ============================================================================
-# HÜCRE 13: ENSEMBLE MODEL (TÜM MODELLERİN BİRLEŞİMİ)
-# ============================================================================
-
-print("\n" + "=" * 60)
-print("   🏆 ENSEMBLE MODEL (Ağırlıklı Oylama)")
-print("=" * 60)
-
-# Her modelin tahmin olasılıklarını ağırlıklı ortala
-# F1-score'a göre ağırlık ver
-# Test sonuçlarından ağırlık seçmek test sızıntısı oluşturur. Validation
-# tabanlı ayrı bir optimizasyon eklenene kadar önceden belirlenmiş eşit ağırlık.
-weights = {'lstm': 0.25, 'bilstm': 0.25, 'cnn': 0.25, 'bert': 0.25}
-print("   Ensemble ağırlıkları: eşit ağırlık (test sızıntısı yok)")
-
-# Ağırlıklı ensemble
-ensemble_prob = (
-    weights['lstm'] * lstm_prob +
-    weights['bilstm'] * bilstm_prob +
-    weights['cnn'] * cnn_prob +
-    weights['bert'] * np.array(all_probs)
-)
-ensemble_pred = (ensemble_prob >= 0.5).astype(int)
-ensemble_sonuc = performans_raporu_ciz(y_test, ensemble_pred, ensemble_prob, 'ENSEMBLE')
-
-
-# ============================================================================
-# HÜCRE 14: MODEL KARŞILAŞTIRMA
-# ============================================================================
-
-print("\n" + "=" * 60)
-print("   📊 MODEL KARŞILAŞTIRMA")
-print("=" * 60)
-
-tum_sonuclar = [lstm_sonuc, bilstm_sonuc, cnn_sonuc, bert_sonuc, ensemble_sonuc]
-df_sonuc = pd.DataFrame(tum_sonuclar)
-print("\n" + df_sonuc.to_string(index=False))
-
-# Karşılaştırma grafiği
-fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-modeller = df_sonuc['model'].tolist()
-x = np.arange(len(modeller))
-colors = ['#3498db', '#2ecc71', '#e67e22', '#9b59b6', '#e74c3c']
-
-for ax_idx, (metric, title) in enumerate([
-    ('accuracy', 'Accuracy'), ('f1_score', 'F1-Score'), ('roc_auc', 'ROC-AUC')
-]):
-    vals = df_sonuc[metric].values
-    bars = axes[ax_idx].bar(x, vals, color=colors, edgecolor='black')
-    axes[ax_idx].set_title(f'{title} Karşılaştırma', fontsize=14, fontweight='bold')
-    axes[ax_idx].set_ylabel(title, fontsize=12)
-    axes[ax_idx].set_xticks(x)
-    axes[ax_idx].set_xticklabels(modeller, fontsize=9, rotation=15)
-    axes[ax_idx].set_ylim(0.5, 1.0)
-    for bar, val in zip(bars, vals):
-        axes[ax_idx].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
-                          f'{val:.4f}', ha='center', fontweight='bold', fontsize=9)
-
-plt.tight_layout()
-plt.savefig(os.path.join(SONUC_KLASORU, 'model_karsilastirma.png'), dpi=150, bbox_inches='tight')
-plt.show()
-
-df_sonuc.to_csv(os.path.join(SONUC_KLASORU, 'model_karsilastirma.csv'), index=False)
-with open(os.path.join(SONUC_KLASORU, 'model_metrics.json'), 'w', encoding='utf-8') as metrics_file:
-    json.dump(tum_sonuclar, metrics_file, ensure_ascii=False, indent=2)
-
-en_iyi = df_sonuc.loc[df_sonuc['f1_score'].idxmax()]
-print(f"\n🏆 EN İYİ MODEL: {en_iyi['model']}")
-print(f"   Accuracy:  {en_iyi['accuracy']:.4f}")
-print(f"   Precision: {en_iyi['precision']:.4f}")
-print(f"   Recall:    {en_iyi['recall']:.4f}")
-print(f"   F1-Score:  {en_iyi['f1_score']:.4f}")
-print(f"   ROC-AUC:   {en_iyi['roc_auc']:.4f}")
-
-
-# ============================================================================
-# HÜCRE 15: ÖRNEK TAHMİN
-# ============================================================================
-
-print("\n" + "=" * 60)
-print(f"   🔮 ÖRNEK TAHMİNLER (BERT)")
-print("=" * 60)
-
-ornek_metinler = [
-    "Bu çok güzel bir paylaşım teşekkürler",
-    "Seni öldüreceğim lan aptal herif",
-    "Bugün hava çok güzel dışarı çıkalım mı",
-    "Siktir git buradan gerizekalı",
-    "Atatürk çok büyük bir lider",
-    "Senin gibi salağı görmedim",
-    "Harika bir gol attı tebrikler",
-    "Hepiniz geri zekalısınız hiçbiriniz beğenmiyor",
-]
-
-bert_model.eval()
-print()
-for metin in ornek_metinler:
-    encoding = bert_tokenizer(
-        metin, add_special_tokens=True, max_length=BERT_MAX_LEN,
-        padding='max_length', truncation=True,
-        return_attention_mask=True, return_tensors='pt'
-    )
-    with torch.no_grad():
-        input_ids = encoding['input_ids'].to(device)
-        attention_mask = encoding['attention_mask'].to(device)
-        with autocast():
-            outputs = bert_model(input_ids, attention_mask=attention_mask)
-        probs = torch.softmax(outputs.logits.float(), dim=1)
-        pred = torch.argmax(probs, dim=1).item()
-        conf = probs[0][pred].item()
-
-    emoji = "🟢" if pred == 0 else "🔴"
-    etiket = "Normal" if pred == 0 else "Saldırgan"
-    print(f"   {emoji} [{etiket}] (%{conf*100:.1f}) → \"{metin}\"")
-
-
-# ============================================================================
-# HÜCRE 16: SONUÇLARI KAYDET
-# ============================================================================
-
-if IN_COLAB:
-    print("\n" + "=" * 60)
-    print("   💾 OTOMATİK GOOGLE DRIVE YEDEKLEMESİ")
-    print("=" * 60)
-    try:
-        from google.colab import drive
-        import shutil
-
-        print("Google Drive'a bağlanılıyor. (Ekrana çıkan pencereden izin verin)")
-        drive.mount('/content/drive')
-
-        hedef_klasor = '/content/drive/MyDrive/saldirgan_icerik_projesi'
-        hedef_sonuc = os.path.join(hedef_klasor, 'sonuclar')
-        hedef_model = os.path.join(hedef_klasor, 'modeller')
-        hedef_veri = os.path.join(hedef_klasor, 'veri_setleri')
-
-        os.makedirs(hedef_sonuc, exist_ok=True)
-        os.makedirs(hedef_model, exist_ok=True)
-        os.makedirs(hedef_veri, exist_ok=True)
-
-        print("Grafikler ve sonuçlar kopyalanıyor...")
-        for dosya in os.listdir(SONUC_KLASORU):
-            shutil.copy(os.path.join(SONUC_KLASORU, dosya), os.path.join(hedef_sonuc, dosya))
-
-        print("Eğitilmiş modeller kopyalanıyor...")
-        for dosya in os.listdir(MODEL_KLASORU):
-            kaynak = os.path.join(MODEL_KLASORU, dosya)
-            hedef = os.path.join(hedef_model, dosya)
-            if os.path.isdir(kaynak):
-                shutil.copytree(kaynak, hedef, dirs_exist_ok=True)
+    def run(self) -> list[PredictionBundle]:
+        self.config.result_dir.mkdir(parents=True, exist_ok=True)
+        self.config.model_dir.mkdir(parents=True, exist_ok=True)
+        # TensorFlow'u BERT'ten once import etmek Colab GPU bellegini rezerve
+        # edebilir. Global seed asamasinda yalnizca kullanilacak Torch runtime'i
+        # hazirlanir; Keras kendi egiticisinde, bellek buyumesinden sonra seedlenir.
+        set_global_seed(
+            self.config.seed,
+            seed_torch="bert" in self.config.models,
+            seed_tensorflow=False,
+        )
+        self.data.load()
+        bundles: list[PredictionBundle] = []
+
+        model_order = list(self.config.models)
+        if "bert" in model_order and len(model_order) > 1:
+            model_order.remove("bert")
+            model_order.insert(0, "bert")
+            print("Colab GPU bellegi icin BERT once, Keras modelleri sonra egitilecek.")
+
+        for model_name in model_order:
+            print(f"\n{'=' * 72}\n{model_name.upper()} eğitimi\n{'=' * 72}")
+            if model_name == "bert":
+                bundle = TransformerModelTrainer(self.config, self.data).train()
             else:
-                shutil.copy2(kaynak, hedef)
+                bundle = KerasModelTrainer(
+                    self.config,
+                    self.data,
+                    model_name,
+                    self.keras_resource_cache,
+                ).train()
+            bundles.append(bundle)
+            self._save_intermediate_results(bundles)
 
-        print("Eğitim veri setleri kopyalanıyor...")
-        for dosya in ('train.csv', 'valid.csv', 'test.csv'):
-            kaynak = os.path.join(VERI_KLASORU, dosya)
-            if os.path.exists(kaynak):
-                shutil.copy2(kaynak, os.path.join(hedef_veri, dosya))
+        self._save_intermediate_results(bundles)
+        self._print_results(bundles)
+        return bundles
 
-        print(f"\n✅ BAŞARILI! Tüm dosyalar Google Drive hesabında '{hedef_klasor}' klasörüne güvenle kaydedildi.")
-    except Exception as e:
-        print("\n❌ Drive yedeklemesi sırasında bir hata oluştu:")
-        print(e)
+    def _save_intermediate_results(self, bundles: Sequence[PredictionBundle]) -> None:
+        rows: list[dict[str, Any]] = []
+        details: dict[str, Any] = {}
+        for bundle in bundles:
+            row: dict[str, Any] = {"model": bundle.model_name}
+            row.update({f"validation_{key}": value for key, value in bundle.validation_metrics.items()})
+            row.update({f"test_{key}": value for key, value in bundle.test_metrics.items()})
+            row["temperature"] = bundle.temperature
+            row["artifact"] = bundle.artifact
+            rows.append(row)
+            details[bundle.model_name] = row
+        pd.DataFrame(rows).to_csv(
+            self.config.result_dir / "model_karsilastirma.csv", index=False, encoding="utf-8"
+        )
+        (self.config.result_dir / "model_metrics.json").write_text(
+            json.dumps(details, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
+        )
+        self._save_comparison_plots(bundles)
 
-print("\n" + "=" * 60)
-print("   ✅ TÜM İŞLEMLER TAMAMLANDI!")
-print("=" * 60)
-print(f"""
-   📊 Sonuçlar: {SONUC_KLASORU}
-   🧠 Modeller: {MODEL_KLASORU}
+    def _save_comparison_plots(self, bundles: Sequence[PredictionBundle]) -> None:
+        if not bundles:
+            return
 
-   Anti-overfitting teknikler kullanıldı:
-     ✅ L2 Regularization ({L2_REG})
-     ✅ Label Smoothing ({LABEL_SMOOTH})
-     ✅ BatchNormalization
-     ✅ Dropout ({DROPOUT_RATE})
-     ✅ EarlyStopping (patience=5)
-     ✅ Class Weights
-     ✅ Data Augmentation (+{len(df_aug):,} satır)
-     ✅ Gradient Clipping
-     ✅ Attention Mekanizması
-     ✅ Multi-Kernel CNN
-     ✅ Discriminative Learning Rates (BERT)
-     ✅ Mixed Precision Training
-     ✅ Ensemble Model
-""")
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        plot_dir = self.config.result_dir / "grafikler"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        sns.set_theme(style="whitegrid", context="notebook")
+        model_names = [bundle.model_name.upper() for bundle in bundles]
+
+        def save(figure: Any, filename: str) -> None:
+            figure.tight_layout()
+            figure.savefig(plot_dir / filename, dpi=170, bbox_inches="tight")
+            plt.close(figure)
+
+        core_metrics = ("accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc")
+        metric_labels = ("Accuracy", "Precision", "Recall", "F1", "ROC-AUC", "PR-AUC")
+        figure, axes = plt.subplots(1, 2, figsize=(17, 6), sharey=True)
+        x_positions = np.arange(len(model_names))
+        width = 0.8 / len(core_metrics)
+        for split_name, axis in (("validation", axes[0]), ("test", axes[1])):
+            for metric_index, (metric, label) in enumerate(zip(core_metrics, metric_labels)):
+                values = [
+                    getattr(bundle, f"{split_name}_metrics").get(metric, np.nan)
+                    for bundle in bundles
+                ]
+                offset = (metric_index - (len(core_metrics) - 1) / 2) * width
+                axis.bar(x_positions + offset, values, width=width, label=label)
+            axis.set_xticks(x_positions, model_names)
+            axis.set_ylim(0, 1.05)
+            axis.set_title(f"{split_name.title()} model karşılaştırması")
+            axis.set_ylabel("Skor")
+        axes[1].legend(ncol=2, bbox_to_anchor=(1.02, 1), loc="upper left")
+        save(figure, "00_model_skor_karsilastirmasi.png")
+
+        error_frame = pd.DataFrame(
+            {
+                "Model": model_names,
+                "Yanlış pozitif oranı": [
+                    bundle.test_metrics["false_positive_rate"] for bundle in bundles
+                ],
+                "Yanlış negatif oranı": [
+                    bundle.test_metrics["false_negative_rate"] for bundle in bundles
+                ],
+            }
+        ).melt(id_vars="Model", var_name="Hata", value_name="Oran")
+        figure, axes = plt.subplots(1, 2, figsize=(14, 5))
+        sns.barplot(data=error_frame, x="Model", y="Oran", hue="Hata", ax=axes[0])
+        axes[0].axhline(
+            self.config.target_false_positive_rate,
+            color="black",
+            linestyle="--",
+            label="Hedef FPR",
+        )
+        axes[0].set_title("Test hata oranları")
+        calibration_frame = pd.DataFrame(
+            {
+                "Model": model_names,
+                "Brier": [bundle.test_metrics["brier"] for bundle in bundles],
+                "ECE": [bundle.test_metrics["ece"] for bundle in bundles],
+            }
+        ).melt(id_vars="Model", var_name="Metrik", value_name="Değer")
+        sns.barplot(data=calibration_frame, x="Model", y="Değer", hue="Metrik", ax=axes[1])
+        axes[1].set_title("Test kalibrasyon hataları (düşük daha iyi)")
+        save(figure, "00_model_hata_ve_kalibrasyon.png")
+
+        class_metric_frame = pd.DataFrame(
+            [
+                {
+                    "Model": bundle.model_name.upper(),
+                    "Temiz Precision": bundle.test_metrics["class_0_precision"],
+                    "Temiz Recall": bundle.test_metrics["class_0_recall"],
+                    "Temiz F1": bundle.test_metrics["class_0_f1"],
+                    "Saldırgan Precision": bundle.test_metrics["class_1_precision"],
+                    "Saldırgan Recall": bundle.test_metrics["class_1_recall"],
+                    "Saldırgan F1": bundle.test_metrics["class_1_f1"],
+                }
+                for bundle in bundles
+            ]
+        ).set_index("Model")
+        figure, ax = plt.subplots(
+            figsize=(12, max(4, 0.8 * len(class_metric_frame)))
+        )
+        sns.heatmap(
+            class_metric_frame,
+            annot=True,
+            fmt=".3f",
+            cmap="YlGnBu",
+            vmin=0,
+            vmax=1,
+            ax=ax,
+        )
+        ax.set_title("Test sınıf bazlı metrikler")
+        save(figure, "00_model_sinif_bazli_metrikler.png")
+
+        figure, axes = plt.subplots(1, 2, figsize=(13, 5))
+        threshold_bars = axes[0].bar(
+            model_names, [bundle.threshold for bundle in bundles], color="#4c72b0"
+        )
+        axes[0].bar_label(threshold_bars, fmt="%.3f")
+        axes[0].set(title="Validation ile seçilen karar eşiği", ylim=(0, 1.05))
+        temperature_bars = axes[1].bar(
+            model_names, [bundle.temperature for bundle in bundles], color="#dd8452"
+        )
+        axes[1].bar_label(temperature_bars, fmt="%.3f")
+        axes[1].set_title("Olasılık kalibrasyonu sıcaklığı")
+        save(figure, "00_model_esik_ve_sicaklik.png")
+
+    @staticmethod
+    def _print_results(bundles: Sequence[PredictionBundle]) -> None:
+        print("\nModel karşılaştırması (model seçimi validation F1 ile)")
+        for bundle in bundles:
+            print(
+                f"  {bundle.model_name:10s} | val F1={bundle.validation_metrics['f1']:.4f} "
+                f"test F1={bundle.test_metrics['f1']:.4f} "
+                f"test PR-AUC={bundle.test_metrics['pr_auc']:.4f} "
+                f"eşik={bundle.threshold:.3f}"
+            )
+        best = max(bundles, key=lambda bundle: bundle.validation_metrics["f1"])
+        print(f"\nValidation'a göre en iyi tek model: {best.model_name}")
+
+
+def prepare_training_data(
+    config: TrainingConfig,
+    raw_data_dirs: Sequence[Path] = (),
+    *,
+    generate_plots: bool = False,
+) -> None:
+    """Ham CSV'lerden eğitim splitlerini aynı Python ortamında yeniden üretir.
+
+    Bu seçenek özellikle Colab'da eski ``veri_setleri`` dosyalarının yanlışlıkla
+    kullanılmasını engeller. Girdi klasörü verilmezse temizleme pipeline'ı proje
+    kökünü, bir üst klasörü ve ``veri setleri ve url`` klasörünü tarar.
+    """
+
+    cleaner_script = SCRIPT_DIR / "01_veri_temizleme.py"
+    if not cleaner_script.exists():
+        raise FileNotFoundError(f"Veri temizleme betiği bulunamadı: {cleaner_script}")
+
+    command = [
+        sys.executable,
+        str(cleaner_script),
+        "--output-dir",
+        str(config.data_dir),
+        "--report-dir",
+        str(config.result_dir / "veri_kalitesi"),
+    ]
+    for raw_data_dir in raw_data_dirs:
+        command.extend(("--input-dir", str(Path(raw_data_dir).resolve())))
+    if generate_plots:
+        command.append("--plots")
+
+    print(
+        "Ham veriler temizleniyor ve train/valid/test splitleri yeniden oluşturuluyor...",
+        flush=True,
+    )
+    subprocess.run(command, cwd=config.project_dir, check=True)
+
+    required_outputs = [
+        config.data_dir / "train.csv",
+        config.data_dir / "valid.csv",
+        config.data_dir / "test.csv",
+        config.data_dir / "dataset_manifest.json",
+    ]
+    missing = [str(path) for path in required_outputs if not path.exists()]
+    if missing:
+        raise RuntimeError(f"Veri hazırlama tamamlanmadı; eksik çıktılar: {missing}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=None)
+    parser.add_argument("--result-dir", type=Path, default=None)
+    parser.add_argument("--model-dir", type=Path, default=None)
+    parser.add_argument("--models", default="lstm,cnn,cnn_lstm")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--target-fpr", type=float, default=0.01)
+    parser.add_argument("--bert-model", default="dbmdz/bert-base-turkish-cased")
+    parser.add_argument("--bert-epochs", type=float, default=3.0)
+    parser.add_argument("--bert-batch-size", type=int, default=16)
+    parser.add_argument("--keras-epochs", type=int, default=30)
+    parser.add_argument("--keras-batch-size", type=int, default=64)
+    parser.add_argument("--word2vec-epochs", type=int, default=10)
+    parser.add_argument(
+        "--prepare-data",
+        action="store_true",
+        help="Eğitimden/dry-run'dan önce tüm ham CSV'leri birleştirip splitleri yeniler.",
+    )
+    parser.add_argument(
+        "--raw-data-dir",
+        action="append",
+        type=Path,
+        default=[],
+        help=(
+            "Ham CSV klasörü; birden çok kez verilebilir. Verilmezse proje kökü, "
+            "bir üst klasör ve 'veri setleri ve url' otomatik taranır."
+        ),
+    )
+    parser.add_argument(
+        "--prepare-plots",
+        action="store_true",
+        help="--prepare-data sırasında veri analiz grafiklerini de üretir.",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="YOL",
+        help="BERT egitimini verilen checkpoint'ten; yol verilmezse son checkpoint'ten surdur.",
+    )
+    compile_group = parser.add_mutually_exclusive_group()
+    compile_group.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Desteklenen GPU'da torch.compile kullan (Colab T4 icin onerilmez).",
+    )
+    compile_group.add_argument(
+        "--no-torch-compile",
+        dest="torch_compile",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.set_defaults(torch_compile=False)
+    parser.add_argument("--no-gradient-checkpointing", action="store_true")
+    parser.add_argument("--deploy-backend", action="store_true")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Bağımlılık/model indirmeden split ve sızıntı kontrollerini çalıştırır.",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> Any:
+    args = build_parser().parse_args(argv)
+    config = TrainingConfig(
+        data_dir=args.data_dir,
+        result_dir=args.result_dir,
+        model_dir=args.model_dir,
+        models=tuple(args.models.split(",")),
+        seed=args.seed,
+        target_false_positive_rate=args.target_fpr,
+        transformer_model=args.bert_model,
+        transformer_epochs=args.bert_epochs,
+        transformer_batch_size=args.bert_batch_size,
+        keras_epochs=args.keras_epochs,
+        keras_batch_size=args.keras_batch_size,
+        word2vec_epochs=args.word2vec_epochs,
+        torch_compile=args.torch_compile,
+        gradient_checkpointing=not args.no_gradient_checkpointing,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        deploy_backend=args.deploy_backend,
+    )
+    if args.prepare_data:
+        prepare_training_data(
+            config,
+            raw_data_dirs=args.raw_data_dir,
+            generate_plots=args.prepare_plots,
+        )
+    pipeline = TrainingPipeline(config)
+    if args.dry_run:
+        result = pipeline.dry_run()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return result
+    return pipeline.run()
+
+
+if __name__ == "__main__":
+    main()
